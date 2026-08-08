@@ -5,13 +5,23 @@
   "description": "NeuraKeep: local-first, source-cited memory for AI agents.",
   "type": "module",
   "bin": {
-    "neurakeep": "./dist/cli/index.js",
-    "umos": "./dist/cli/index.js"
+    "neurakeep": "dist/cli/index.js",
+    "umos": "dist/cli/index.js"
   },
-  "files": ["dist", "docs", "README.md", "LICENSE"],
-  "repository": {"type": "git", "url": "https://github.com/dominiclachance/neurakeep.git"},
+  "files": [
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dominiclachance/neurakeep.git"
+  },
   "homepage": "https://www.neurakeep.com/mcp-server-directory/",
-  "bugs": {"url": "https://github.com/dominiclachance/neurakeep/issues"},
+  "bugs": {
+    "url": "https://github.com/dominiclachance/neurakeep/issues"
+  },
   "scripts": {
     "build": "tsc",
     "build:web": "vite build",
