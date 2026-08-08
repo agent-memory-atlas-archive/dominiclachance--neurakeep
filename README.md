@@ -29,6 +29,14 @@ Requirements:
 - Node.js 20+
 - npm
 
+Install the published CLI:
+
+```bash
+npm install -g neurakeep
+neurakeep init --root .umos
+neurakeep mcp --root .umos
+```
+
 ```bash
 npm install
 npm run build:all
