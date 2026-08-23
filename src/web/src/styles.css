@@ -53,6 +53,118 @@ button:disabled {
   min-height: 0;
 }
 
+.authScreen {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 22% 18%, rgba(75, 159, 136, .16), transparent 32%),
+    linear-gradient(135deg, #101214, #171a1d 56%, #121517);
+  padding: 18px;
+  box-sizing: border-box;
+}
+
+.authPanel {
+  width: min(430px, 100%);
+  border: 1px solid #30363b;
+  border-radius: 8px;
+  background: rgba(23, 26, 29, .96);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .35);
+  padding: 22px;
+}
+
+.authPanel .appBrand {
+  margin-bottom: 14px;
+}
+
+.authPanel p {
+  color: #c7d0d9;
+  line-height: 1.5;
+  margin: 8px 0 16px;
+}
+
+.authPanel button,
+.authPanel input {
+  width: 100%;
+}
+
+.authPanel details {
+  border-top: 1px solid #30363b;
+  margin-top: 14px;
+  padding-top: 12px;
+}
+
+.authPanel summary {
+  cursor: pointer;
+  color: #c7d0d9;
+  font-size: 12px;
+  font-weight: 650;
+  margin-bottom: 8px;
+}
+
+.authPanel.subscriptionPanel {
+  width: min(820px, 100%);
+  max-height: calc(100vh - 36px);
+  overflow: auto;
+}
+
+.subscriptionPlans {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.subscriptionPlan {
+  border: 1px solid #394047;
+  border-radius: 8px;
+  background: #1d2226;
+  padding: 16px;
+}
+
+.subscriptionPlan.selected {
+  border-color: #6cc8aa;
+  box-shadow: 0 0 0 1px rgba(108, 200, 170, .3);
+}
+
+.subscriptionPlan h3 {
+  margin: 0;
+}
+
+.subscriptionPrice {
+  color: #f4f1ea;
+  font-size: 28px;
+  font-weight: 750;
+  margin-top: 8px;
+}
+
+.subscriptionPrice span {
+  color: #aeb9c2;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.launchOffer,
+.successNotice {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #5b4c85;
+  border-radius: 7px;
+  background: rgba(91, 76, 133, .2);
+  padding: 11px 12px;
+}
+
+.successNotice {
+  border-color: #3f8b74;
+  background: rgba(63, 139, 116, .18);
+}
+
+@media (max-width: 680px) {
+  .subscriptionPlans {
+    grid-template-columns: 1fr;
+  }
+}
+
 aside {
   overflow: hidden;
   min-width: 0;
@@ -86,6 +198,78 @@ h1 {
   height: 30px;
   flex: 0 0 auto;
   border-radius: 7px;
+}
+
+.sessionBar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid #30363b;
+  border-radius: 7px;
+  background: #121517;
+  margin: 8px 0 7px;
+  padding: 7px;
+}
+
+.workspaceSwitcher {
+  min-width: 160px;
+  max-width: 240px;
+}
+
+.ssoDiscovery,
+.teamCheckoutFields,
+.teamInvite,
+.existingTeams {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.teamInvite {
+  grid-template-columns: minmax(0, 1fr) 140px auto;
+  align-items: end;
+}
+
+.existingTeams button { text-align: left; }
+
+@media (max-width: 720px) {
+  .workspaceSwitcher { max-width: 100%; width: 100%; }
+  .teamInvite { grid-template-columns: 1fr; }
+}
+
+.sessionIdentity {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.sessionIdentity b,
+.sessionIdentity span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sessionIdentity b {
+  color: #f4f1ea;
+  font-size: 12px;
+}
+
+.sessionIdentity span {
+  color: #9fb1c1;
+  font-size: 10px;
+}
+
+.logoutButton {
+  width: auto;
+  min-width: 66px;
+  margin: 0;
+  background: #3b2426;
+  border-color: #8f484d;
+  color: #ffd9dc;
+  padding: 5px 8px;
 }
 
 h2 {
@@ -209,6 +393,10 @@ aside input, aside button, aside select {
   border-radius: 7px;
   background: #171a1d;
   padding: 10px;
+}
+
+.viewCard.wide {
+  grid-column: 1 / -1;
 }
 
 .viewTable {
@@ -396,6 +584,32 @@ aside input, aside button, aside select {
   max-width: 100%;
 }
 
+.importWizard textarea {
+  min-height: 142px;
+}
+
+.wizardSteps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 6px;
+  margin: 8px 0 10px;
+}
+
+.wizardSteps span {
+  border: 1px solid #30363b;
+  border-radius: 6px;
+  background: #111417;
+  color: #9fb1c1;
+  padding: 6px 8px;
+  font-size: 11px;
+}
+
+.wizardSteps span.ready {
+  border-color: #3f7869;
+  background: #12211d;
+  color: #d8fff3;
+}
+
 .edgeFilters label {
   display: inline-flex;
   align-items: center;
@@ -440,14 +654,20 @@ aside input, aside button, aside select {
   width: auto;
 }
 
+.graphControls .activeControl {
+  background: #d6b2ff;
+  border-color: #f4f1ea;
+  color: #101214;
+}
+
 .graphInfoPanel {
   position: absolute;
   left: 12px;
   bottom: 12px;
   z-index: 3;
   width: min(340px, calc(100% - 24px));
-  max-height: 34vh;
-  overflow: auto;
+  max-height: none;
+  overflow: visible;
   border: 1px solid #30363b;
   border-radius: 8px;
   background: rgba(16,18,20,.9);
@@ -535,6 +755,49 @@ text {
   fill: #f4f1ea;
   font-size: 11px;
   pointer-events: none;
+}
+
+.graphSavedPanel {
+  position: absolute;
+  bottom: 12px;
+  right: 12px;
+  z-index: 3;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  width: min(330px, calc(100% - 24px));
+  border: 1px solid #30363b;
+  border-radius: 8px;
+  background: rgba(16,18,20,.88);
+  padding: 8px;
+}
+
+.graphSavedPanel h2 {
+  grid-column: 1 / -1;
+  margin-top: 0;
+}
+
+.graphSavedPanel select,
+.graphSavedPanel input {
+  min-width: 0;
+}
+
+.graphSavedPanel button {
+  width: auto;
+}
+
+g.node text {
+  cursor: grab;
+  pointer-events: auto;
+}
+
+g.node circle {
+  cursor: grab;
+}
+
+g.node:active text,
+g.node:active circle {
+  cursor: grabbing;
 }
 
 text.hiddenBadge {
@@ -700,6 +963,75 @@ pre {
   border-radius: 6px;
   background: #111417;
   padding: 8px;
+}
+
+.reviewSummary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.warningMetric {
+  border-color: #8e4d4d;
+  background: #211719;
+}
+
+.acceptState,
+.skipState {
+  display: inline-block;
+  border: 1px solid #3c434a;
+  border-radius: 999px;
+  margin-top: 6px;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+.acceptState {
+  color: #d8fff3;
+  border-color: #4b9f88;
+  background: #17352f;
+}
+
+.skipState {
+  color: #ffd3d3;
+  border-color: #8e4d4d;
+  background: #321d1f;
+}
+
+.activityFeed {
+  grid-column: span 2;
+}
+
+.launchSteps {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0;
+}
+
+.launchStep {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  border: 1px solid #3d3434;
+  border-radius: 6px;
+  background: #161314;
+  padding: 8px;
+  font-size: 12px;
+}
+
+.launchStep b {
+  color: #ff958f;
+}
+
+.launchStep.ready {
+  border-color: #2f4d43;
+  background: #121a17;
+}
+
+.launchStep.ready b {
+  color: #76d59f;
 }
 
 @media (max-width: 860px) {

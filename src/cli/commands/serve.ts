@@ -10,8 +10,11 @@ export interface ServeCommandOptions {
   host?: string;
   port?: string;
   token?: string;
+  serviceToken?: string | string[];
   readWrite?: boolean;
   ui?: boolean;
+  hosted?: boolean;
+  firebaseProject?: string;
 }
 
 export function serveCommand(options: ServeCommandOptions): void {
@@ -35,9 +38,23 @@ export function serveCommand(options: ServeCommandOptions): void {
     host: options.host ?? "127.0.0.1",
     port: parsePort(options.port),
     token: options.token ?? process.env.NEURAKEEP_MCP_TOKEN,
+    serviceTokens: serviceTokens(options.serviceToken),
     readOnly: !options.readWrite,
-    serveUi: Boolean(options.ui)
+    serveUi: Boolean(options.ui),
+    hosted: {
+      enabled: Boolean(options.hosted) || process.env.NEURAKEEP_HOSTED === "1",
+      firebaseProjectId: options.firebaseProject ?? process.env.FIREBASE_PROJECT_ID
+    }
   });
+}
+
+function serviceTokens(value: string | string[] | undefined): string[] {
+  const cliTokens = Array.isArray(value) ? value : value ? [value] : [];
+  const envTokens = (process.env.NEURAKEEP_SERVICE_TOKENS ?? "")
+    .split(",")
+    .map((token) => token.trim())
+    .filter(Boolean);
+  return Array.from(new Set([...cliTokens, ...envTokens]));
 }
 
 function parsePort(value: string | undefined): number {

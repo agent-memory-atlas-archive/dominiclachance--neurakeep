@@ -63,6 +63,8 @@ function ensureSchemaV2Columns(db: UmosDatabase): void {
   addColumnIfMissing(db, "proposals", "source_origin", "TEXT NOT NULL DEFAULT 'agent'");
   addColumnIfMissing(db, "proposals", "visibility", "TEXT NOT NULL DEFAULT 'private'");
   addColumnIfMissing(db, "proposals", "sensitivity", "TEXT NOT NULL DEFAULT 'normal'");
+  addColumnIfMissing(db, "hosted_access_tokens", "email", "TEXT");
+  addColumnIfMissing(db, "hosted_access_tokens", "space_id", "TEXT NOT NULL DEFAULT 'personal'");
 }
 
 function addColumnIfMissing(
@@ -88,7 +90,16 @@ export function tableCounts(db: UmosDatabase): Record<string, number> {
     "facts",
     "failures",
     "proposals",
-    "eval_cases"
+    "eval_cases",
+    "hosted_tenants",
+    "hosted_spaces",
+    "hosted_memberships",
+    "hosted_organizations",
+    "hosted_org_memberships",
+    "hosted_org_spaces",
+    "hosted_org_invitations",
+    "hosted_audit_events",
+    "hosted_access_tokens"
   ];
   const counts: Record<string, number> = {};
 

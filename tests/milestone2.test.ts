@@ -30,7 +30,7 @@ Production must source the env file before rebuilding the web app.
 
 ## Failed Path
 
-Do not rebuild with missing production public env values.
+Do not rebuild with missing Firebase public env values.
 `,
       "utf8"
     );
@@ -74,7 +74,7 @@ Do not rebuild with missing production public env values.
       expect(rows[0]?.space).toBe("project");
 
       const searchResults = searchSections(db, {
-        query: "production env rebuild",
+        query: "Firebase env rebuild",
         limit: 5,
         space: "project",
         neighbors: 1

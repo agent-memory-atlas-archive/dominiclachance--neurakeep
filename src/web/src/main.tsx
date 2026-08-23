@@ -2,15 +2,33 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import {
   apiClient,
+  acceptInvitation,
   authSettings,
+  billingStatus,
+  createHostedToken,
+  createTeamSpace,
+  discoverSsoProviders,
+  inviteTeamMember,
+  listOrganizations,
+  listTeamMembers,
+  listHostedTokens,
   listProposals,
   loadGraph,
   loadProposal,
+  openBillingPortal,
+  revokeHostedToken,
   saveGraphState,
-  type AuthSettings
+  startCheckout,
+  updateTeamMember,
+  type AuthSettings,
+  type BillingAccess,
+  type HostedAccessToken,
+  type HostedOrganization
 } from "./api.js";
-import { computeLayout, defaultPhysics, type LayoutPoint, type PhysicsSettings } from "./graphEngine.js";
+import { computeLayout, defaultPhysics, graphWorldSize, type LayoutPoint, type PhysicsSettings } from "./graphEngine.js";
+import { trackCtaEvent } from "./analytics.js";
 import { Markdown } from "./markdown.js";
+import { firebaseConfigured, signInWithEnterpriseProvider, signInWithFirebase, signOutOfFirebase } from "./firebaseAuth.js";
 import type {
   GraphEdge,
   GraphNode,
@@ -47,7 +65,7 @@ function App(): React.ReactElement {
   const [selected, setSelected] = useState<GraphNode | null>(null);
   const [focusIds, setFocusIds] = useState<Set<string> | null>(null);
   const [expandedBranches, setExpandedBranches] = useState<Set<string>>(new Set());
-  const [query, setQuery] = useState("memory poisoning");
+  const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
   const [sourceId, setSourceId] = useState("latest");
   const [proposalId, setProposalId] = useState("");
@@ -63,6 +81,9 @@ function App(): React.ReactElement {
     failuresOnly: false
   });
   const [auth, setAuth] = useState<AuthSettings | null>(null);
+  const [billing, setBilling] = useState<BillingAccess | null>(null);
+  const [authChecking, setAuthChecking] = useState(true);
+  const [authError, setAuthError] = useState("");
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [modal, setModal] = useState<{ title: string; body: React.ReactNode } | null>(null);
   const [searching, setSearching] = useState(false);
@@ -80,16 +101,51 @@ function App(): React.ReactElement {
 
   const resetRootGraph = useCallback(async () => {
     const data = await loadGraph({ depth: graphDepth, limit: graphLimit });
-    setGraph({ ...data, state: { ...(data.state ?? {}), mode: "all", collapsedBranches: [] } });
+    setGraph(rootOverviewPayload(data));
     setFocusIds(null);
     setSelected(null);
     setExpandedBranches(new Set());
   }, [graphDepth, graphLimit]);
 
+  const authenticate = useCallback(async () => {
+    setAuthChecking(true);
+    try {
+      const inviteToken = new URLSearchParams(window.location.search).get("invite");
+      if (inviteToken && apiClient.getToken()) {
+        const accepted = await acceptInvitation(inviteToken) as { organization?: { id?: string }; spaces?: Array<{ id?: string }> };
+        if (accepted.organization?.id && accepted.spaces?.[0]?.id) apiClient.setWorkspace(accepted.organization.id, accepted.spaces[0].id);
+        const cleaned = new URL(window.location.href);
+        cleaned.searchParams.delete("invite");
+        window.history.replaceState({}, "", cleaned);
+      }
+      const access = await billingStatus();
+      setBilling(access);
+      if (!access.entitled) {
+        setAuth(null);
+        setAuthError("");
+        setGraph({ nodes: [], edges: [], state: {} });
+        return;
+      }
+      const next = await authSettings();
+      setAuth(next);
+      setAuthError("");
+      const data = await loadGraph({ depth: graphDepth, limit: graphLimit });
+      setGraph(rootOverviewPayload(data));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Authentication failed";
+      setAuth(null);
+      setBilling(null);
+      setAuthError(message);
+      setGraph({ nodes: [], edges: [], state: {} });
+      if (!/unauthorized/i.test(message)) toast(message, "error");
+    } finally {
+      setAuthChecking(false);
+    }
+  }, [graphDepth, graphLimit, toast]);
+
   useEffect(() => {
-    refreshGraph().catch((error) => toast(error.message, "error"));
-    authSettings().then(setAuth).catch(() => null);
-  }, [refreshGraph, toast]);
+    authenticate().catch((error) => toast(error.message, "error"));
+  }, [authenticate, toast]);
 
   useEffect(() => {
     const onHash = () => setRoute(routeFromHash());
@@ -206,7 +262,33 @@ function App(): React.ReactElement {
     await refreshGraph();
   };
 
+  const logout = useCallback(async () => {
+    await signOutOfFirebase().catch(() => null);
+    apiClient.setToken("");
+    apiClient.setWorkspace();
+    setAuth(null);
+    setBilling(null);
+    setGraph({ nodes: [], edges: [], state: {} });
+    setSelected(null);
+    setFocusIds(null);
+    setExpandedBranches(new Set());
+    setAuthError("signed out");
+    toast("Signed out");
+  }, [toast]);
+
   const state = graph.state ?? {};
+
+  if (authChecking && !auth && !billing) {
+    return <AuthLoading />;
+  }
+
+  if (billing?.authenticated && !billing.entitled) {
+    return <SubscriptionGate billing={billing} refresh={authenticate} logout={logout} toast={toast} toasts={toasts} />;
+  }
+
+  if (!auth) {
+    return <AuthGate error={authError} onAuthenticated={authenticate} toast={toast} toasts={toasts} />;
+  }
 
   return (
     <div className="app" data-route={route}>
@@ -215,10 +297,18 @@ function App(): React.ReactElement {
           <img src="/assets/icon.svg" alt="" width="30" height="30" />
           <span>NeuraKeep</span>
         </h1>
+        <div className="sessionBar">
+          <div className="sessionIdentity">
+            <b>{sessionLabel(auth)}</b>
+            <span>{auth.provider ?? "local"} / {auth.readOnly ? "read-only" : "read-write"}</span>
+          </div>
+          <WorkspaceSwitcher currentTenant={auth.hosted?.tenantId ?? ""} currentSpace={auth.hosted?.spaceId ?? ""} refresh={authenticate} toast={toast} />
+          <button className="logoutButton" onClick={() => { trackCtaEvent("hosted_logout_click", { section: "header" }); logout().catch((error) => toast(error.message, "error")); }}>Log out</button>
+        </div>
         <nav className="routes">
-          {(["graph", "search", "inbox", "proposals", "quality", "settings"] as RouteName[]).map((name) => (
+          {(["graph", "search", "inbox", "proposals", "connect", "activity", "quality", "settings"] as RouteName[]).map((name) => (
             <button key={name} className={route === name ? "active" : ""} onClick={() => { window.location.hash = name; setRoute(name); }}>
-              {name === "proposals" ? "Props" : title(name)}
+              {routeLabel(name)}
             </button>
           ))}
         </nav>
@@ -235,6 +325,13 @@ function App(): React.ReactElement {
               <option value="source">Source-centric</option>
               <option value="failures">Failures-only</option>
               <option value="decisions">Decisions-only</option>
+            </select>
+            <select
+              value={state.layoutMode ?? "graph"}
+              onChange={(event) => void updateState({ ...state, layoutMode: event.target.value as GraphState["layoutMode"] })}
+            >
+              <option value="graph">Graph layout</option>
+              <option value="tree">Tree layout</option>
             </select>
             <label>Expand depth<select value={graphDepth} onChange={(event) => setGraphDepth(Number(event.target.value))}>
               <option value={1}>1 hop</option>
@@ -324,8 +421,10 @@ function App(): React.ReactElement {
         {route === "search" && <SearchView query={query} setQuery={setQuery} runSearch={runSearch} searching={searching} toast={toast} filters={searchFilters} setFilters={setSearchFilters} />}
         {route === "inbox" && <InboxView toast={toast} refreshGraph={refreshGraph} />}
         {route === "proposals" && <ProposalsView toast={toast} refreshGraph={refreshGraph} openRecord={openRecord} />}
+        {route === "connect" && <ConnectView toast={toast} />}
+        {route === "activity" && <ActivityView toast={toast} />}
         {route === "quality" && <QualityView toast={toast} openRecord={openRecord} refreshGraph={refreshGraph} />}
-        {route === "settings" && <SettingsView auth={auth} setAuth={setAuth} toast={toast} />}
+        {route === "settings" && <SettingsView auth={auth} billing={billing} setAuth={setAuth} toast={toast} />}
       </main>
       {modal && <Modal title={modal.title} close={() => setModal(null)}>{modal.body}</Modal>}
       <div className="toastStack">{toasts.map((row) => <div key={row.id} className={`toast ${row.type ?? ""}`}>{row.message}</div>)}</div>
@@ -349,8 +448,14 @@ function GraphView(props: {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [size, setSize] = useState({ width: 900, height: 700 });
   const [view, setView] = useState({ x: 0, y: 0, scale: 1 });
-  const [drag, setDrag] = useState<{ id?: string; x: number; y: number; startX: number; startY: number } | null>(null);
+  const [drag, setDrag] = useState<{ id?: string; x: number; y: number; startX: number; startY: number; moved?: boolean } | null>(null);
+  const [dragOverrides, setDragOverrides] = useState<Record<string, LayoutPoint>>({});
   const [workerPositions, setWorkerPositions] = useState<Map<string, LayoutPoint> | null>(null);
+  const [viewName, setViewName] = useState("");
+  const [savedViews, setSavedViews] = useState<GraphSavedView[]>(() => readGraphViews());
+  const [selectedView, setSelectedView] = useState("");
+  const layoutKeyRef = useRef("");
+  const suppressClickRef = useRef(false);
 
   useEffect(() => {
     const resize = () => {
@@ -367,8 +472,9 @@ function GraphView(props: {
     const collapsed = new Set(props.state.collapsed ?? []);
     const branchHidden = branchHiddenIds(props.graph, props.state.collapsedBranches ?? []);
     const q = props.typeFilter.toLowerCase();
+    const rootOverview = !props.graph.meta?.focusId && !props.selectedId && !props.focusIds;
     return props.graph.nodes.filter((node) => {
-      if (collapsed.has(node.id)) return false;
+      if (collapsed.has(node.id) && !(rootOverview && node.type === "root")) return false;
       if (branchHidden.has(node.id)) return false;
       if (modeIds && !modeIds.has(node.id)) return false;
       if (q && !`${node.label} ${node.type}`.toLowerCase().includes(q)) return false;
@@ -379,18 +485,22 @@ function GraphView(props: {
   const filteredIds = useMemo(() => new Set(filtered.map((node) => node.id)), [filtered]);
   const hiddenCounts = useMemo(() => hiddenNeighborCounts(props.graph, filteredIds), [props.graph, filteredIds]);
   const breadcrumb = useMemo(() => graphBreadcrumb(props.graph, props.selectedId), [props.graph, props.selectedId]);
-
+  const layoutMode = props.state.layoutMode ?? "graph";
   const edges = useMemo(() => {
     const edgeTypes = new Set(props.state.edgeTypes ?? ["root", "contains", "cites", "next"]);
     return props.graph.edges.filter((edge) => filteredIds.has(edge.from) && filteredIds.has(edge.to) && edgeTypes.has(edge.type));
   }, [props.graph.edges, props.state.edgeTypes, filteredIds]);
+  const graphWorld = useMemo(() => graphWorldSize(filtered.length, size.width, size.height), [filtered.length, size.width, size.height]);
+  const treeWorld = useMemo(() => treeWorldSize(filtered, edges, size.width, size.height), [filtered, edges, size.width, size.height]);
+  const world = layoutMode === "tree" ? treeWorld : graphWorld;
+  const centerWorldView = useCallback(() => ({ x: size.width / 2 - world.width / 2, y: size.height / 2 - world.height / 2, scale: 1 }), [size.width, size.height, world.width, world.height]);
 
-  const syncPositions = useMemo(
-    () => filtered.length > 160 ? null : computeLayout(filtered, edges, size.width, size.height, props.state),
-    [filtered, edges, size, props.state]
-  );
+  const syncPositions = useMemo(() => {
+    if (layoutMode === "tree") return computeTreeLayout(filtered, edges, world.width, world.height, props.selectedId);
+    return filtered.length > 160 ? null : computeLayout(filtered, edges, world.width, world.height, props.state);
+  }, [filtered, edges, world, props.state, layoutMode, props.selectedId]);
   useEffect(() => {
-    if (filtered.length <= 160) {
+    if (layoutMode === "tree" || filtered.length <= 160) {
       setWorkerPositions(null);
       return;
     }
@@ -402,21 +512,32 @@ function GraphView(props: {
         worker.terminate();
       };
       worker.onerror = () => {
-        if (!cancelled) setWorkerPositions(computeLayout(filtered, edges, size.width, size.height, props.state));
+        if (!cancelled) setWorkerPositions(computeLayout(filtered, edges, world.width, world.height, props.state));
         worker.terminate();
       };
-      worker.postMessage({ nodes: filtered, edges, width: size.width, height: size.height, state: props.state });
+      worker.postMessage({ nodes: filtered, edges, width: world.width, height: world.height, state: props.state });
       return () => {
         cancelled = true;
         worker.terminate();
       };
     } catch {
-      setWorkerPositions(computeLayout(filtered, edges, size.width, size.height, props.state));
+      setWorkerPositions(computeLayout(filtered, edges, world.width, world.height, props.state));
     }
-  }, [filtered, edges, size, props.state]);
-  const positions = syncPositions ?? workerPositions ?? new Map<string, LayoutPoint>();
+  }, [filtered, edges, world, props.state, layoutMode]);
+  const positions = useMemo(() => {
+    const next = new Map(syncPositions ?? workerPositions ?? new Map<string, LayoutPoint>());
+    for (const [id, point] of Object.entries(dragOverrides)) next.set(id, point);
+    return next;
+  }, [syncPositions, workerPositions, dragOverrides]);
 
-  const graphPoint = (event: React.MouseEvent): LayoutPoint => {
+  useEffect(() => {
+    const layoutKey = `${layoutMode}:${filtered.map((node) => node.id).join("|")}:${edges.length}:${world.width}x${world.height}`;
+    if (layoutKeyRef.current === layoutKey) return;
+    layoutKeyRef.current = layoutKey;
+    setView(centerWorldView());
+  }, [filtered, edges.length, world, centerWorldView]);
+
+  const graphPoint = (event: { clientX: number; clientY: number }): LayoutPoint => {
     const rect = svgRef.current?.getBoundingClientRect();
     const x = (event.clientX - (rect?.left ?? 0) - view.x) / view.scale;
     const y = (event.clientY - (rect?.top ?? 0) - view.y) / view.scale;
@@ -432,13 +553,48 @@ function GraphView(props: {
     });
   };
 
+  const centerSelected = (): void => {
+    const point = positions.get(props.selectedId);
+    if (!point) return;
+    setView((old) => ({
+      ...old,
+      x: size.width / 2 - point.x * old.scale,
+      y: size.height / 2 - point.y * old.scale
+    }));
+  };
+
+  const resetLayout = async (): Promise<void> => {
+    setDragOverrides({});
+    setView(centerWorldView());
+    await props.onState({ ...props.state, layout: {}, pinned: [] });
+  };
+
+  const saveNamedView = (): void => {
+    const name = viewName.trim() || `View ${savedViews.length + 1}`;
+    const next = [...savedViews.filter((item) => item.name !== name), { name, view, selectedId: props.selectedId, state: props.state }];
+    setSavedViews(next);
+    setSelectedView(name);
+    setViewName("");
+    localStorage.setItem("neurakeep_graph_views", JSON.stringify(next));
+  };
+
+  const loadNamedView = (): void => {
+    const saved = savedViews.find((item) => item.name === selectedView);
+    if (!saved) return;
+    setView(saved.view);
+    void props.onState(saved.state);
+  };
+
   return (
     <section className="graphWrap">
       <div className="graphControls">
         <button onClick={() => setView((old) => ({ ...old, scale: Math.max(0.35, old.scale / 1.2) }))}>-</button>
         <span>{Math.round(view.scale * 100)}%</span>
         <button onClick={() => setView((old) => ({ ...old, scale: Math.min(4, old.scale * 1.2) }))}>+</button>
-        <button onClick={() => { setView({ x: 0, y: 0, scale: 1 }); props.onResetGraph(); }}>Reset</button>
+        <button className={layoutMode === "graph" ? "activeControl" : ""} onClick={() => props.onState({ ...props.state, layoutMode: "graph" })}>Graph</button>
+        <button className={layoutMode === "tree" ? "activeControl" : ""} onClick={() => props.onState({ ...props.state, layoutMode: "tree" })}>Tree</button>
+        <button onClick={() => { setView(centerWorldView()); props.onResetGraph(); }}>Reset</button>
+        <button disabled={!props.selectedId} onClick={centerSelected}>Center</button>
       </div>
       <div className="graphInfoPanel">
         <h2>Legend</h2>
@@ -447,15 +603,27 @@ function GraphView(props: {
         </div>
         <h2>Node Details</h2>
         {breadcrumb.length > 0 && <div className="breadcrumbs">{breadcrumb.map((node, index) => <span key={node.id}>{index > 0 ? ">" : ""}{node.label}</span>)}</div>}
-        <div className="meta">{props.selectedId ? `${props.selectedId} selected. Its connected neighborhood is loaded. Alt-drag to pin.` : "Overview mode shows a bounded set. Click a node to load connected nodes. Alt-drag to pin."}</div>
-        <div className="meta">{props.graph.meta ? `${props.graph.meta.visibleNodes}/${props.graph.meta.totalNodes} nodes visible, depth ${props.graph.meta.depth}, cap ${props.graph.meta.limit}${props.graph.meta.truncated ? " (trimmed)" : ""}` : `${filtered.length} nodes visible`}</div>
+        <div className="meta">{props.selectedId ? `${props.selectedId} selected. Its connected neighborhood is loaded. Drag nodes to pin their position.` : "Overview mode shows a bounded set. Click a node to load connected nodes. Drag nodes to pin their position."}</div>
+        <div className="meta">{props.graph.meta ? `${props.graph.meta.visibleNodes}/${props.graph.meta.totalNodes} nodes loaded, depth ${props.graph.meta.depth}, cap ${props.graph.meta.limit}${props.graph.meta.truncated ? " (trimmed)" : ""}` : `${filtered.length} nodes loaded`}. World canvas: {Math.round(world.width)}x{Math.round(world.height)}. Drag blank canvas to pan.</div>
         <div className="proposalTools">
           <button disabled={!props.selectedId} onClick={() => props.selectedId && props.onExpandBranch(props.selectedId)}>Expand branch</button>
+          <button disabled={!props.selectedId} onClick={() => props.selectedId && props.onExpandBranch(props.selectedId)}>Show related</button>
           <button disabled={!props.selectedId} onClick={() => props.selectedId && props.onCollapseBranch(props.selectedId)}>
             {props.selectedId && props.expandedBranches.has(props.selectedId) ? "Collapse branch" : "Hide branch"}
           </button>
           <button onClick={props.onResetGraph}>Root overview</button>
+          <button onClick={() => resetLayout().catch(() => null)}>Reset layout</button>
         </div>
+      </div>
+      <div className="graphSavedPanel">
+        <h2>Views</h2>
+        <input value={viewName} onChange={(event) => setViewName(event.target.value)} placeholder="View name" />
+        <button onClick={saveNamedView}>Save view</button>
+        <select value={selectedView} onChange={(event) => setSelectedView(event.target.value)}>
+          <option value="">Saved views</option>
+          {savedViews.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}
+        </select>
+        <button disabled={!selectedView} onClick={loadNamedView}>Load</button>
       </div>
       <svg
         ref={svgRef}
@@ -469,17 +637,22 @@ function GraphView(props: {
           if (!drag) return;
           if (drag.id) {
             const point = graphPoint(event);
-            props.graph.state.layout = { ...(props.graph.state.layout ?? {}), [drag.id]: { ...point, pinned: true } };
-            props.graph.state.pinned = Array.from(new Set([...(props.graph.state.pinned ?? []), drag.id]));
+            const distance = Math.hypot(event.clientX - drag.x, event.clientY - drag.y);
+            if (distance > 4) suppressClickRef.current = true;
+            setDrag((current) => current && current.id === drag.id ? { ...current, moved: current.moved || distance > 4 } : current);
+            setDragOverrides((current) => ({ ...current, [drag.id!]: point }));
           } else {
             setView((old) => ({ ...old, x: drag.startX + event.clientX - drag.x, y: drag.startY + event.clientY - drag.y }));
           }
         }}
         onMouseUp={(event) => {
-          if (drag?.id) void saveNode(drag.id, graphPoint(event));
+          if (drag?.id && (drag.moved || suppressClickRef.current)) void saveNode(drag.id, dragOverrides[drag.id] ?? graphPoint(event));
           setDrag(null);
         }}
-        onMouseLeave={() => setDrag(null)}
+        onMouseLeave={() => {
+          if (drag?.id && (drag.moved || suppressClickRef.current)) void saveNode(drag.id, dragOverrides[drag.id] ?? { x: drag.startX, y: drag.startY });
+          setDrag(null);
+        }}
         onMouseDown={(event) => {
           if (event.target === svgRef.current) setDrag({ x: event.clientX, y: event.clientY, startX: view.x, startY: view.y });
         }}
@@ -498,13 +671,42 @@ function GraphView(props: {
               <g
                 key={node.id}
                 className={`node ${props.selectedId === node.id ? "selected" : ""}`}
-                onMouseDown={(event) => {
-                  if (event.altKey) {
-                    event.stopPropagation();
-                    setDrag({ id: node.id, x: event.clientX, y: event.clientY, startX: p.x, startY: p.y });
-                  }
+                onPointerDown={(event) => {
+                  event.stopPropagation();
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  suppressClickRef.current = false;
+                  setDrag({ id: node.id, x: event.clientX, y: event.clientY, startX: p.x, startY: p.y });
                 }}
-                onClick={(event) => { event.stopPropagation(); props.onSelect(node); }}
+                onPointerMove={(event) => {
+                  if (drag?.id !== node.id) return;
+                  event.stopPropagation();
+                  const point = graphPoint(event);
+                  const distance = Math.hypot(event.clientX - drag.x, event.clientY - drag.y);
+                  if (distance > 4) suppressClickRef.current = true;
+                  setDrag((current) => current?.id === node.id ? { ...current, moved: current.moved || distance > 4 } : current);
+                  setDragOverrides((current) => ({ ...current, [node.id]: point }));
+                }}
+                onPointerUp={(event) => {
+                  if (drag?.id !== node.id) return;
+                  event.stopPropagation();
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                  const moved = drag.moved || suppressClickRef.current;
+                  if (moved) void saveNode(node.id, dragOverrides[node.id] ?? graphPoint(event));
+                  setDrag(null);
+                }}
+                onPointerCancel={(event) => {
+                  if (drag?.id !== node.id) return;
+                  event.stopPropagation();
+                  setDrag(null);
+                }}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  if (suppressClickRef.current) {
+                    suppressClickRef.current = false;
+                    return;
+                  }
+                  props.onSelect(node);
+                }}
               >
                 <circle className="hit" cx={p.x} cy={p.y} r={15} />
                 <circle cx={p.x} cy={p.y} r={8} fill={colors[node.type]} />
@@ -673,6 +875,7 @@ function ProposalReviewer({ proposal, toast, refreshGraph, openRecord, afterAppl
     <div className="reviewer" data-testid="proposal-reviewer">
       <h2>Review Proposal</h2>
       <div className="chips"><span>{proposal.proposalId}</span><span>{proposal.governor?.warnings.length ?? 0} warnings</span><span>{proposal.governor?.blocked.length ?? 0} blocked</span></div>
+      <ProposalReviewSummary diff={diff} selected={selected} warnings={governorItems} />
       <div className="proposalTools">
         <button onClick={() => setSelected(selectedMap(diff, true))}>Select all</button>
         <button onClick={() => setSelected(selectedMap(diff, false))}>Select none</button>
@@ -688,6 +891,16 @@ function ProposalReviewer({ proposal, toast, refreshGraph, openRecord, afterAppl
   );
 }
 
+function ProposalReviewSummary({ diff, selected, warnings }: { diff: ProposalDiff; selected: Record<string, boolean>; warnings: Array<{ severity?: string; itemId: string; message: string }> }): React.ReactElement {
+  const selectedCount = Object.values(selected).filter(Boolean).length;
+  const total = countItems(diff);
+  const citationCount = (["events", "facts", "failures"] as Array<keyof ProposalDiff>)
+    .flatMap((kind) => diff[kind])
+    .reduce((count, row) => count + new Set([...(row.sourceIds ?? []), ...(row.sectionIds ?? [])]).size, 0);
+  const blocked = warnings.filter((warning) => warning.severity === "block").length;
+  return <div className="reviewSummary"><div className="metric"><b>{selectedCount}</b><span>accepted</span></div><div className="metric"><b>{total - selectedCount}</b><span>skipped</span></div><div className="metric"><b>{citationCount}</b><span>citations</span></div><div className={blocked ? "metric warningMetric" : "metric"}><b>{warnings.length}</b><span>{blocked ? "needs review" : "warnings"}</span></div></div>;
+}
+
 function ReviewTable({ title: titleText, kind, rows, selected, setSelected, update, warnings, openRecord }: {
   title: string;
   kind: keyof ProposalDiff;
@@ -695,7 +908,7 @@ function ReviewTable({ title: titleText, kind, rows, selected, setSelected, upda
   selected: Record<string, boolean>;
   setSelected: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
   update: (rows: any[]) => void;
-  warnings: Array<{ itemId: string; message: string }>;
+  warnings: Array<{ severity?: string; itemId: string; message: string }>;
   openRecord: (id: string) => Promise<void>;
 }): React.ReactElement {
   const bulkPrefix = `${kind}:`;
@@ -707,16 +920,17 @@ function ReviewTable({ title: titleText, kind, rows, selected, setSelected, upda
           {rows.map((row, index) => {
             const key = `${kind}:${index}`;
             const warning = warnings.find((item) => item.itemId === row.id);
+            const accepted = selected[key] ?? true;
             return (
               <tr key={key}>
-                <td><input type="checkbox" checked={selected[key] ?? true} onChange={(event) => setSelected((old) => ({ ...old, [key]: event.target.checked }))} /></td>
+                <td><input type="checkbox" checked={accepted} onChange={(event) => setSelected((old) => ({ ...old, [key]: event.target.checked }))} /><div className={accepted ? "acceptState" : "skipState"}>{accepted ? "Accept" : "Skip"}</div></td>
                 <td>
                   {Object.entries(row).filter(([field]) => !["sourceIds", "sectionIds", "id"].includes(field)).map(([field, value]) => (
-                    <label key={field}>{field}<input value={String(value ?? "")} onChange={(event) => update(rows.map((item, rowIndex) => rowIndex === index ? { ...item, [field]: event.target.value } : item) as never[])} /></label>
+                    <label key={field}>{field}{String(value ?? "").length > 80 ? <textarea value={String(value ?? "")} onChange={(event) => update(rows.map((item, rowIndex) => rowIndex === index ? { ...item, [field]: event.target.value } : item) as never[])} /> : <input value={String(value ?? "")} onChange={(event) => update(rows.map((item, rowIndex) => rowIndex === index ? { ...item, [field]: event.target.value } : item) as never[])} />}</label>
                   ))}
-                  {warning && <div className="warn">{warning.message}</div>}
+                  {warning && <div className="warn"><b>{warning.severity === "block" ? "Blocked" : "Warning"}</b><p>{plainWarning(warning.message)}</p></div>}
                 </td>
-                <td><CitationButtons ids={[...(row.sourceIds as string[] ?? []), ...(row.sectionIds as string[] ?? [])]} openRecord={openRecord} /></td>
+                <td><div className="meta">Citations</div><CitationButtons ids={[...(row.sourceIds as string[] ?? []), ...(row.sectionIds as string[] ?? [])]} openRecord={openRecord} /></td>
               </tr>
             );
           })}
@@ -783,6 +997,9 @@ function InboxView({ toast, refreshGraph }: { toast: (message: string, type?: To
   const [dragging, setDragging] = useState(false);
   const [ocrHealth, setOcrHealth] = useState<Record<string, any> | null>(null);
   const [importSupport, setImportSupport] = useState<Record<string, any> | null>(null);
+  const [pasteTitle, setPasteTitle] = useState("pasted-memory.md");
+  const [pasteText, setPasteText] = useState("");
+  const [lastImport, setLastImport] = useState<Record<string, any> | null>(null);
   const reload = useCallback(async () => {
     setLoading(true);
     try {
@@ -815,7 +1032,33 @@ function InboxView({ toast, refreshGraph }: { toast: (message: string, type?: To
     await reload();
     toast(`${items.length} file${items.length === 1 ? "" : "s"} uploaded and queued for review`);
   };
-  return <section className="viewSurface"><h2>Inbox</h2><div className="viewGrid"><div className="viewCard"><h3>Manual Import</h3><div className="meta">Import a local markdown, text, session JSONL, or PDF from the workspace, vault, or your home folder.</div><div className={`dropZone ${dragging ? "dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); void uploadFiles(event.dataTransfer.files).catch((error) => toast(error.message, "error")); }}><b>Drop PDFs or notes here</b><span>Files are copied to the local inbox, indexed, and queued as proposals.</span><input type="file" multiple accept=".pdf,.md,.txt,.jsonl" onChange={(event) => event.target.files && uploadFiles(event.target.files).catch((error) => toast(error.message, "error"))} /></div><label>File path<input value={manualPath} onChange={(event) => setManualPath(event.target.value)} placeholder="C:\\Users\\macro\\Downloads\\paper.pdf" /></label><label>Kind<select value={manualKind} onChange={(event) => setManualKind(event.target.value)}><option value="auto">auto</option><option value="markdown">markdown</option><option value="note">note</option><option value="session">session</option><option value="pdf">pdf</option></select></label><button disabled={!manualPath.trim()} onClick={() => importManual().catch((error) => toast(error.message, "error"))}>Import Memory</button><button onClick={() => apiClient.api<{ ingested: unknown[]; skipped: unknown[] }>("/api/memory/sync", { method: "POST", body: "{}" }).then((result) => refreshGraph().then(reload).then(() => toast(`Memory sync: ${result.ingested.length} new, ${result.skipped.length} skipped`))).catch((error) => toast(error.message, "error"))}>Sync workspace memory</button></div><ImportSupportCard support={importSupport} /><OcrHealthCard health={ocrHealth} /><div className="viewCard"><h3>Files</h3>{loading && <div className="meta">Loading inbox...</div>}{!loading && files.length === 0 && <div className="meta">No inbox files waiting. Watchers and self-memory summaries queue proposals here before anything becomes durable.</div>}{files.map((file) => <div className="result" key={file.path}><b>{file.name}</b><div className="meta">{file.path}</div><div className="chips"><span>{file.kind}</span><span>{Math.round(file.bytes / 1024)} KB</span><span>{file.sourceHint ?? "inbox"}</span><span>{file.trustHint ?? "normal"}</span>{(file.riskFlags ?? []).map((flag) => <span className="warnChip" key={flag}>{flag}</span>)}</div><button onClick={() => apiClient.api("/api/ingest", { method: "POST", body: JSON.stringify({ path: file.path, kind: file.kind }) }).then(refreshGraph).then(reload).then(() => toast("File ingested and queued for proposal review")).catch((error) => toast(error.message, "error"))}>Ingest</button></div>)}</div><div className="viewCard"><h3>Watcher</h3><div className="meta">Watcher ingestion creates pending proposals only; it does not auto-apply durable memory. Session/profile imports are deduped and redacted before queueing when secrets are detected.</div><div className="chips"><span>{String(status.running ? "running" : "stopped")}</span><span>{String(status.runCount ?? 0)} runs</span></div><button disabled={Boolean(status.running)} onClick={() => apiClient.api("/api/watch/start", { method: "POST", body: "{}" }).then(reload).then(() => toast("Watcher started")).catch((error) => toast(error.message, "error"))}>Start Watcher</button><button disabled={!status.running} onClick={() => apiClient.api("/api/watch/stop", { method: "POST", body: "{}" }).then(reload).then(() => toast("Watcher stopped")).catch((error) => toast(error.message, "error"))}>Stop Watcher</button><pre>{JSON.stringify(status.history ?? [], null, 2)}</pre></div></div></section>;
+  const importPastedMemory = async (): Promise<void> => {
+    if (!pasteText.trim()) {
+      toast("Paste memory text first.", "error");
+      return;
+    }
+    const result = await apiClient.api<Record<string, any>>("/api/import/upload", {
+      method: "POST",
+      body: JSON.stringify({
+        fileName: pasteTitle.trim() || "pasted-memory.md",
+        kind: pasteTitle.toLowerCase().endsWith(".txt") ? "note" : "markdown",
+        contentBase64: textToBase64(pasteText)
+      })
+    });
+    setPasteText("");
+    setLastImport(result);
+    await refreshGraph();
+    await reload();
+    toast(result.proposal?.proposalId ? "Pasted memory queued for proposal review" : "Pasted memory indexed");
+  };
+  const importSample = async (): Promise<void> => {
+    trackCtaEvent("demo_sample_import_click", { section: "inbox" });
+    const result = await apiClient.api<{ proposal?: { proposalId?: string } }>("/api/onboarding/sample-memory", { method: "POST", body: "{}" });
+    await refreshGraph();
+    await reload();
+    toast(result.proposal?.proposalId ? "Sample memory imported and queued for review" : "Sample memory already indexed");
+  };
+  return <section className="viewSurface"><h2>Inbox</h2><div className="viewGrid"><div className="viewCard importWizard"><h3>Memory Import Wizard</h3><div className="wizardSteps"><span className="ready">1. Add source</span><span className={pasteText.trim() || files.length ? "ready" : ""}>2. Index raw memory</span><span className={lastImport?.proposal ? "ready" : ""}>3. Review proposal</span><span>4. Apply selected facts</span></div><label>Title<input value={pasteTitle} onChange={(event) => setPasteTitle(event.target.value)} placeholder="customer-notes.md" /></label><label>Paste memory<textarea value={pasteText} onChange={(event) => setPasteText(event.target.value)} rows={8} placeholder="Paste notes, decisions, failed paths, or session summary..." /></label><div className="proposalTools"><button disabled={!pasteText.trim()} onClick={() => importPastedMemory().catch((error) => toast(error.message, "error"))}>Queue pasted memory</button><button onClick={() => importSample().catch((error) => toast(error.message, "error"))}>Import first-run sample</button></div>{lastImport && <div className="result"><b>Queued</b><div className="meta">Source: {String(lastImport.ingest?.sourceId ?? lastImport.uploadPath ?? "indexed")} / Proposal: {String(lastImport.proposal?.proposalId ?? "none")}</div></div>}</div><div className="viewCard"><h3>Manual Import</h3><div className="meta">Import a local markdown, text, session JSONL, or PDF from the workspace, vault, or your home folder.</div><div className={`dropZone ${dragging ? "dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); void uploadFiles(event.dataTransfer.files).catch((error) => toast(error.message, "error")); }}><b>Drop PDFs or notes here</b><span>Files are copied to the local inbox, indexed, and queued as proposals.</span><input type="file" multiple accept=".pdf,.md,.txt,.jsonl" onChange={(event) => event.target.files && uploadFiles(event.target.files).catch((error) => toast(error.message, "error"))} /></div><label>File path<input value={manualPath} onChange={(event) => setManualPath(event.target.value)} placeholder="C:\\Users\\macro\\Downloads\\paper.pdf" /></label><label>Kind<select value={manualKind} onChange={(event) => setManualKind(event.target.value)}><option value="auto">auto</option><option value="markdown">markdown</option><option value="note">note</option><option value="session">session</option><option value="pdf">pdf</option></select></label><button disabled={!manualPath.trim()} onClick={() => importManual().catch((error) => toast(error.message, "error"))}>Import Memory</button><button onClick={() => apiClient.api<{ ingested: unknown[]; skipped: unknown[] }>("/api/memory/sync", { method: "POST", body: "{}" }).then((result) => refreshGraph().then(reload).then(() => toast(`Memory sync: ${result.ingested.length} new, ${result.skipped.length} skipped`))).catch((error) => toast(error.message, "error"))}>Sync workspace memory</button></div><div className="viewCard"><h3>First-Run Sample</h3><div className="meta">Creates a small source-cited sample and queues a proposal so a new account has something to review and search immediately.</div><button onClick={() => importSample().catch((error) => toast(error.message, "error"))}>Import sample memory</button></div><ImportSupportCard support={importSupport} /><OcrHealthCard health={ocrHealth} /><div className="viewCard"><h3>Files</h3>{loading && <div className="meta">Loading inbox...</div>}{!loading && files.length === 0 && <div className="meta">No inbox files waiting. Watchers and self-memory summaries queue proposals here before anything becomes durable.</div>}{files.map((file) => <div className="result" key={file.path}><b>{file.name}</b><div className="meta">{file.path}</div><div className="chips"><span>{file.kind}</span><span>{Math.round(file.bytes / 1024)} KB</span><span>{file.sourceHint ?? "inbox"}</span><span>{file.trustHint ?? "normal"}</span>{(file.riskFlags ?? []).map((flag) => <span className="warnChip" key={flag}>{flag}</span>)}</div><button onClick={() => apiClient.api("/api/ingest", { method: "POST", body: JSON.stringify({ path: file.path, kind: file.kind }) }).then(refreshGraph).then(reload).then(() => toast("File ingested and queued for proposal review")).catch((error) => toast(error.message, "error"))}>Ingest</button></div>)}</div><div className="viewCard"><h3>Watcher</h3><div className="meta">Watcher ingestion creates pending proposals only; it does not auto-apply durable memory. Session/profile imports are deduped and redacted before queueing when secrets are detected.</div><div className="chips"><span>{String(status.running ? "running" : "stopped")}</span><span>{String(status.runCount ?? 0)} runs</span></div><button disabled={Boolean(status.running)} onClick={() => apiClient.api("/api/watch/start", { method: "POST", body: "{}" }).then(reload).then(() => toast("Watcher started")).catch((error) => toast(error.message, "error"))}>Start Watcher</button><button disabled={!status.running} onClick={() => apiClient.api("/api/watch/stop", { method: "POST", body: "{}" }).then(reload).then(() => toast("Watcher stopped")).catch((error) => toast(error.message, "error"))}>Stop Watcher</button><pre>{JSON.stringify(status.history ?? [], null, 2)}</pre></div></div></section>;
 }
 
 function OcrHealthCard({ health }: { health: Record<string, any> | null }): React.ReactElement {
@@ -826,6 +1069,55 @@ function OcrHealthCard({ health }: { health: Record<string, any> | null }): Reac
 function ImportSupportCard({ support }: { support: Record<string, any> | null }): React.ReactElement {
   const kinds = support?.supportedKinds ?? [];
   return <div className="viewCard"><h3>Import Support</h3><div className="chips">{kinds.map((row: Record<string, unknown>) => <span key={String(row.kind)}>{String(row.kind)} {Array.isArray(row.extensions) ? row.extensions.join("/") : ""}</span>)}</div><div className="meta">Approved roots: {(support?.approvedRoots ?? []).join(" | ") || "loading"}</div><div className="meta">Raw sources index immediately; durable facts, events, failures, and decisions stay proposal-reviewed.</div></div>;
+}
+
+function ConnectView({ toast }: { toast: (message: string, type?: Toast["type"]) => void }): React.ReactElement {
+  const [status, setStatus] = useState<Record<string, any> | null>(null);
+  const [smoke, setSmoke] = useState<Record<string, any> | null>(null);
+  const reload = useCallback(async () => setStatus(await apiClient.api<Record<string, any>>("/api/integrations/status")), []);
+  useEffect(() => { reload().catch((error) => toast(error.message, "error")); }, [reload, toast]);
+  const remote = status?.remoteMcp ?? {};
+  const endpoint = String(remote.endpoint ?? `${window.location.origin}/mcp`);
+  const protectedMetadata = String(remote.protectedResourceMetadata ?? `${window.location.origin}/.well-known/oauth-protected-resource/mcp`);
+  const config = {
+    mcpServers: {
+      neurakeep: {
+        url: endpoint,
+        headers: { Authorization: "Bearer <service-token-or-firebase-id-token>" }
+      }
+    }
+  };
+  const testMcp = async (): Promise<void> => {
+    const result = await apiClient.api<Record<string, any>>("/mcp", {
+      method: "POST",
+      body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method: "tools/list" })
+    });
+    setSmoke(result);
+    toast(`MCP test returned ${(result.result?.tools ?? []).length} tools`);
+  };
+  return <section className="viewSurface"><h2>MCP Connection</h2><div className="viewGrid"><div className="viewCard"><h3>Remote Endpoint</h3><div className="chips"><span>{remote.hosted ? "hosted" : "local"}</span><span>{remote.serviceTokenConfigured ? "service token ready" : "token needed"}</span><span>{status?.server?.readOnly ? "read-only" : "read-write"}</span><span>{status?.tools?.length ?? 0} tools</span></div><label>Endpoint<input readOnly value={endpoint} /></label><label>Protected resource metadata<input readOnly value={protectedMetadata} /></label><div className="proposalTools"><button onClick={() => copyText(endpoint, toast)}>Copy endpoint</button><button onClick={() => copyText(protectedMetadata, toast)}>Copy metadata URL</button><button onClick={() => testMcp().catch((error) => toast(error.message, "error"))}>Test tools/list</button></div>{smoke && <pre>{JSON.stringify(smoke.result ?? smoke, null, 2)}</pre>}</div><div className="viewCard"><h3>Client Config</h3><div className="meta">Use the same hosted endpoint for Claude, Codex, and other MCP clients. Tokens stay private and are never stored in this config snippet.</div><pre>{JSON.stringify(config, null, 2)}</pre><button onClick={() => copyText(JSON.stringify(config, null, 2), toast)}>Copy JSON</button></div><IntegrationStatusCard status={status} /></div></section>;
+}
+
+function ActivityView({ toast }: { toast: (message: string, type?: Toast["type"]) => void }): React.ReactElement {
+  const [hosted, setHosted] = useState<Array<Record<string, unknown>>>([]);
+  const [governor, setGovernor] = useState<Array<Record<string, unknown>>>([]);
+  const [ops, setOps] = useState<Record<string, any> | null>(null);
+  const reload = useCallback(async () => {
+    const [hostedData, governorData, opsData] = await Promise.all([
+      apiClient.api<{ events: Array<Record<string, unknown>> }>("/api/hosted/audit?limit=100"),
+      apiClient.api<{ entries: Array<Record<string, unknown>> }>("/api/governor/audit"),
+      apiClient.api<Record<string, any>>("/api/hosted/ops")
+    ]);
+    setHosted(hostedData.events ?? []);
+    setGovernor(governorData.entries ?? []);
+    setOps(opsData);
+  }, []);
+  useEffect(() => { reload().catch((error) => toast(error.message, "error")); }, [reload, toast]);
+  const feed: Array<Record<string, unknown> & { kind: string; at: unknown }> = [
+    ...hosted.map((row) => ({ ...row, kind: "hosted", at: row.createdAt })),
+    ...governor.map((row) => ({ ...row, kind: "governor", at: row.createdAt }))
+  ].sort((a, b) => String(b.at ?? "").localeCompare(String(a.at ?? ""))).slice(0, 100);
+  return <section className="viewSurface"><h2>Activity</h2><div className="viewGrid"><HostedOpsCard ops={ops} /><div className="viewCard activityFeed"><h3>Audit Feed</h3><button onClick={() => reload().catch((error) => toast(error.message, "error"))}>Refresh</button>{feed.length === 0 && <div className="meta">No audit events yet.</div>}{feed.map((row, index) => <div className="result" key={`${String(row.kind)}-${String(row.id ?? index)}`}><b>{String(row.action ?? row.kind)} / {String(row.status ?? "ok")}</b><div className="meta">{String(row.at ?? "")} / {String(row.kind)} / {String(row.actorEmail ?? row.actorUid ?? "")}</div>{Boolean(row.targetType) && <div className="chips"><span>{String(row.targetType)}</span>{Boolean(row.targetId) ? <span>{String(row.targetId)}</span> : null}</div>}</div>)}</div></div></section>;
 }
 
 function QualityView({ toast, openRecord, refreshGraph }: { toast: (message: string, type?: Toast["type"]) => void; openRecord: (id: string) => Promise<void>; refreshGraph: () => Promise<void> }): React.ReactElement {
@@ -900,7 +1192,7 @@ function QualityBlock({ title: titleText, rows = [], openRecord, toast, refresh 
   })}</div>;
 }
 
-function SettingsView({ auth, setAuth, toast }: { auth: AuthSettings | null; setAuth: (auth: AuthSettings) => void; toast: (message: string, type?: Toast["type"]) => void }): React.ReactElement {
+function SettingsView({ auth, billing, setAuth, toast }: { auth: AuthSettings | null; billing: BillingAccess | null; setAuth: (auth: AuthSettings) => void; toast: (message: string, type?: Toast["type"]) => void }): React.ReactElement {
   const [reports, setReports] = useState<Array<Record<string, unknown>>>([]);
   const [mode, setMode] = useState<AuthSettings["mode"]>("local");
   const [displayName, setDisplayName] = useState("Local NeuraKeep User");
@@ -909,10 +1201,13 @@ function SettingsView({ auth, setAuth, toast }: { auth: AuthSettings | null; set
   const [ocrHealth, setOcrHealth] = useState<Record<string, any> | null>(null);
   const [integration, setIntegration] = useState<Record<string, any> | null>(null);
   const [dailyLoop, setDailyLoop] = useState<Record<string, any> | null>(null);
+  const [ops, setOps] = useState<Record<string, any> | null>(null);
+  const [firebaseUser, setFirebaseUser] = useState("");
   useEffect(() => { apiClient.api<{ reports: Array<Record<string, unknown>> }>("/api/extraction/reports").then((data) => setReports(data.reports)).catch(() => null); }, []);
   useEffect(() => { apiClient.api<Record<string, any>>("/api/import/ocr-health").then(setOcrHealth).catch(() => null); }, []);
   useEffect(() => { apiClient.api<Record<string, any>>("/api/integrations/status").then(setIntegration).catch(() => null); }, []);
   useEffect(() => { apiClient.api<Record<string, any>>("/api/workflow/daily-loop").then(setDailyLoop).catch(() => null); }, []);
+  useEffect(() => { apiClient.api<Record<string, any>>("/api/hosted/ops").then(setOps).catch(() => null); }, []);
   useEffect(() => {
     if (!auth) return;
     setMode(auth.mode);
@@ -936,12 +1231,195 @@ function SettingsView({ auth, setAuth, toast }: { auth: AuthSettings | null; set
     setDailyLoop(result.status ?? result);
     toast("Daily workflow queued summary and synced workspace memory");
   };
-  return <section className="viewSurface"><h2>Settings</h2><div className="viewGrid"><div className="viewCard"><h3>Auth / User</h3><div className="chips"><span>{auth?.provider ?? "local"}</span><span>{auth?.readOnly ? "read-only" : "read-write"}</span><span>{auth?.tokenRequired ? "token required" : "local open"}</span></div><label>Bearer token<input defaultValue={apiClient.getToken()} onChange={(event) => apiClient.setToken(event.target.value)} /></label><label>Mode<select value={mode} onChange={(event) => setMode(event.target.value as AuthSettings["mode"])}><option value="local">local</option><option value="remote">remote</option></select></label><label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label><label>Role<select value={role} onChange={(event) => setRole(event.target.value as AuthSettings["user"]["role"])}><option value="owner">owner</option><option value="operator">operator</option><option value="viewer">viewer</option></select></label><label className="check"><input type="checkbox" checked={allowWrites} onChange={(event) => setAllowWrites(event.target.checked)} />Allow writes when server is read-write</label><button onClick={() => save().catch((error) => toast(error.message, "error"))}>Save auth settings</button><button onClick={() => authSettings().then(setAuth).then(() => toast("Auth settings refreshed")).catch((error) => toast(error.message, "error"))}>Refresh auth</button><pre>{JSON.stringify(auth, null, 2)}</pre></div><IntegrationStatusCard status={integration} /><DailyLoopCard status={dailyLoop} run={() => runDailyLoop().catch((error) => toast(error.message, "error"))} /><OcrHealthCard health={ocrHealth} /><div className="viewCard"><h3>Extraction Eval Reports</h3>{reports.length === 0 && <div className="meta">No extraction eval reports yet.</div>}{reports.map((row) => <div className="result" key={String(row.id)}><b>{String(row.proposalId)}</b><pre>{JSON.stringify(row.score, null, 2)}</pre></div>)}</div></div></section>;
+  const firebaseLogin = async (): Promise<void> => {
+    const result = await signInWithFirebase();
+    apiClient.setToken(result.token);
+    setFirebaseUser(result.user?.email ?? result.user?.displayName ?? "Google user");
+    const next = await authSettings();
+    setAuth(next);
+    toast("Google sign-in connected");
+  };
+  const firebaseLogout = async (): Promise<void> => {
+    await signOutOfFirebase();
+    apiClient.setToken("");
+    setFirebaseUser("");
+    toast("Google session cleared");
+  };
+  return <section className="viewSurface"><h2>Settings</h2><div className="viewGrid"><div className="viewCard"><h3>Auth / User</h3><div className="chips"><span>{auth?.provider ?? "local"}</span><span>{auth?.hosted?.enabled ? "hosted" : "local"}</span><span>{auth?.hosted?.tenantId ?? "local"}</span><span>{auth?.hosted?.spaceId ?? "personal"}</span></div><label>Bearer token / Google ID token<input defaultValue={apiClient.getToken()} onChange={(event) => apiClient.setToken(event.target.value)} /></label><div className="proposalTools"><button disabled={!firebaseConfigured()} title={firebaseConfigured() ? "Continue with Google through Firebase Auth." : "Set VITE_FIREBASE_* public client config before building the hosted web app."} onClick={() => { trackCtaEvent("hosted_login_click", { section: "settings", method: "google" }); firebaseLogin().then(() => trackCtaEvent("login", { section: "settings", method: "google" })).catch((error) => toast(error.message, "error")); }}>Continue with Google</button><button onClick={() => { trackCtaEvent("hosted_logout_click", { section: "settings" }); firebaseLogout().catch((error) => toast(error.message, "error")); }}>Sign out</button></div><div className="meta">{firebaseConfigured() ? `Google sign-in is secured by Firebase Auth${firebaseUser ? ` / ${firebaseUser}` : ""}` : "Google sign-in config is not present in this build. Local mode still works."}</div><label>Mode<select value={mode} onChange={(event) => setMode(event.target.value as AuthSettings["mode"])}><option value="local">local</option><option value="remote">remote</option></select></label><label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label><label>Role<select value={role} onChange={(event) => setRole(event.target.value as AuthSettings["user"]["role"])}><option value="owner">owner</option><option value="operator">operator</option><option value="viewer">viewer</option></select></label><label className="check"><input type="checkbox" checked={allowWrites} onChange={(event) => setAllowWrites(event.target.checked)} />Allow writes when server is read-write</label><button onClick={() => save().catch((error) => toast(error.message, "error"))}>Save auth settings</button><button onClick={() => authSettings().then(setAuth).then(() => toast("Auth settings refreshed")).catch((error) => toast(error.message, "error"))}>Refresh auth</button><pre>{JSON.stringify(auth, null, 2)}</pre></div><BillingCard billing={billing} toast={toast} /><TeamManagementCard auth={auth} toast={toast} /><HostedCard auth={auth} /><IntegrationStatusCard status={integration} /><HostedOpsCard ops={ops} /><DailyLoopCard status={dailyLoop} run={() => runDailyLoop().catch((error) => toast(error.message, "error"))} /><OcrHealthCard health={ocrHealth} /><div className="viewCard"><h3>Extraction Eval Reports</h3>{reports.length === 0 && <div className="meta">No extraction eval reports yet.</div>}{reports.map((row) => <div className="result" key={String(row.id)}><b>{String(row.proposalId)}</b><pre>{JSON.stringify(row.score, null, 2)}</pre></div>)}</div></div></section>;
+}
+
+function WorkspaceSwitcher({ currentTenant, currentSpace, refresh, toast }: { currentTenant: string; currentSpace: string; refresh: () => Promise<void>; toast: (message: string, type?: Toast["type"]) => void }): React.ReactElement {
+  const [organizations, setOrganizations] = useState<HostedOrganization[]>([]);
+  useEffect(() => { listOrganizations().then(setOrganizations).catch(() => null); }, [currentTenant]);
+  const current = currentTenant.startsWith("org_") ? `${currentTenant}:${currentSpace}` : "";
+  const change = async (value: string): Promise<void> => {
+    if (!value) apiClient.setWorkspace();
+    else {
+      const index = value.indexOf(":");
+      apiClient.setWorkspace(value.slice(0, index), value.slice(index + 1));
+    }
+    await refresh();
+    toast("Workspace switched");
+  };
+  return <select className="workspaceSwitcher" aria-label="Workspace" value={current} onChange={(event) => change(event.target.value).catch((error) => toast(error.message, "error"))}><option value="">Personal workspace</option>{organizations.flatMap((organization) => organization.spaces.map((space) => <option key={`${organization.id}:${space.id}`} value={`${organization.id}:${space.id}`}>{organization.name} / {space.name}</option>))}</select>;
+}
+
+function TeamManagementCard({ auth, toast }: { auth: AuthSettings | null; toast: (message: string, type?: Toast["type"]) => void }): React.ReactElement {
+  const organizationId = auth?.hosted?.organizationId;
+  const role = auth?.hosted?.membershipRole ?? auth?.hosted?.roles?.[0];
+  const canManage = role === "owner" || role === "admin";
+  const [members, setMembers] = useState<Array<Record<string, any>>>([]);
+  const [email, setEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState("editor");
+  const [inviteUrl, setInviteUrl] = useState("");
+  const [spaceName, setSpaceName] = useState("");
+  const reload = useCallback(() => canManage ? listTeamMembers().then(setMembers) : Promise.resolve(), [canManage, organizationId]);
+  useEffect(() => { void reload().catch(() => null); }, [reload]);
+  if (!organizationId) return <></>;
+  const invite = async (): Promise<void> => {
+    const result = await inviteTeamMember(email, inviteRole);
+    setInviteUrl(`${window.location.origin}${String(result.inviteUrl)}`);
+    setEmail("");
+    await reload();
+    toast("Invitation created");
+  };
+  const addSpace = async (): Promise<void> => {
+    await createTeamSpace(spaceName);
+    setSpaceName("");
+    toast("Shared space created. Reload the workspace picker to open it.");
+  };
+  return <div className="viewCard"><h3>Team workspace</h3><div className="chips"><span>{auth?.hosted?.organizationName ?? organizationId}</span><span>{role}</span><span>{auth?.hosted?.spaceId}</span></div><div className="meta">Every shared space has its own physical vault. Roles are enforced on API and MCP requests.</div>{canManage && <><label>New shared space<input value={spaceName} onChange={(event) => setSpaceName(event.target.value)} placeholder="Client Alpha" /></label><button disabled={spaceName.trim().length < 2} onClick={() => addSpace().catch((error) => toast(error.message, "error"))}>Create space</button><div className="teamInvite"><label>Invite email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} /></label><label>Role<select value={inviteRole} onChange={(event) => setInviteRole(event.target.value)}><option value="admin">Admin</option><option value="reviewer">Reviewer</option><option value="editor">Editor</option><option value="viewer">Viewer</option></select></label><button disabled={!email.includes("@")} onClick={() => invite().catch((error) => toast(error.message, "error"))}>Create invitation</button></div>{inviteUrl && <div className="result"><b>Copy the invitation link now.</b><pre>{inviteUrl}</pre><button onClick={() => navigator.clipboard.writeText(inviteUrl)}>Copy link</button></div>}{members.map((member) => <div className="result" key={String(member.userId)}><b>{String(member.displayName ?? member.email ?? member.userId)}</b><div className="meta">{String(member.email ?? "")} · {String(member.role)} · {String(member.status)}</div>{member.role !== "owner" && member.status === "active" && <div className="proposalTools"><select value={String(member.role)} onChange={(event) => updateTeamMember(String(member.userId), event.target.value).then(reload).catch((error) => toast(error.message, "error"))}><option value="admin">Admin</option><option value="reviewer">Reviewer</option><option value="editor">Editor</option><option value="viewer">Viewer</option></select><button className="secondary" onClick={() => updateTeamMember(String(member.userId), String(member.role), true).then(reload).catch((error) => toast(error.message, "error"))}>Revoke</button></div>}</div>)}</>}</div>;
+}
+
+function AuthLoading(): React.ReactElement {
+  return <div className="authScreen"><div className="authPanel"><h1 className="appBrand"><img src="/assets/icon.svg" alt="" width="34" height="34" /><span>NeuraKeep</span></h1><h2>Hosted NeuraKeep</h2><p>Checking your account...</p></div></div>;
+}
+
+function sessionLabel(auth: AuthSettings): string {
+  const hostedEmail = auth.hosted?.email;
+  const actor = auth.user.actor as { email?: string; uid?: string } | undefined;
+  return hostedEmail ?? actor?.email ?? auth.user.displayName ?? actor?.uid ?? "Signed in";
+}
+
+function AuthGate({ error, onAuthenticated, toast, toasts }: { error: string; onAuthenticated: () => Promise<void>; toast: (message: string, type?: Toast["type"]) => void; toasts: Toast[] }): React.ReactElement {
+  const [token, setToken] = useState(apiClient.getToken());
+  const [workEmail, setWorkEmail] = useState("");
+  const [providers, setProviders] = useState<Array<{ id: string; type: "saml" | "oidc"; label: string }>>([]);
+  const [busy, setBusy] = useState(false);
+  const login = async (): Promise<void> => {
+    trackCtaEvent("hosted_login_click", { section: "auth_gate", method: "google" });
+    setBusy(true);
+    try {
+      const result = await signInWithFirebase();
+      apiClient.setToken(result.token);
+      await onAuthenticated();
+      trackCtaEvent("login", { section: "auth_gate", method: "google" });
+      toast("Signed in");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const useToken = async (): Promise<void> => {
+    trackCtaEvent("hosted_login_click", { section: "auth_gate", method: "service_token" });
+    setBusy(true);
+    try {
+      apiClient.setToken(token);
+      await onAuthenticated();
+      trackCtaEvent("login", { section: "auth_gate", method: "service_token" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const findSso = async (): Promise<void> => {
+    const discovered = await discoverSsoProviders(workEmail);
+    setProviders(discovered);
+    if (discovered.length === 0) toast("No enterprise SSO provider is configured for that domain.", "error");
+  };
+  const loginSso = async (provider: { id: string; type: "saml" | "oidc"; label: string }): Promise<void> => {
+    setBusy(true);
+    try {
+      const result = await signInWithEnterpriseProvider(provider.id, provider.type);
+      apiClient.setToken(result.token);
+      await onAuthenticated();
+      toast(`Signed in with ${provider.label}`);
+    } finally { setBusy(false); }
+  };
+  return <div className="authScreen"><div className="authPanel"><h1 className="appBrand"><img src="/assets/icon.svg" alt="" width="34" height="34" /><span>NeuraKeep</span></h1><h2>Sign in to hosted NeuraKeep</h2><p>Use Google for a personal or Team account, or discover your organization&apos;s SAML/OIDC sign-in.</p><button disabled={!firebaseConfigured() || busy} onClick={() => login().catch((loginError) => toast(loginError instanceof Error ? loginError.message : "Google sign-in failed", "error"))}>{busy ? "Checking..." : "Continue with Google"}</button><div className="ssoDiscovery"><label>Enterprise SSO<input type="email" value={workEmail} onChange={(event) => setWorkEmail(event.target.value)} placeholder="you@company.com" /></label><button className="secondary" disabled={!workEmail.includes("@") || busy} onClick={() => findSso().catch((nextError) => toast(nextError.message, "error"))}>Find SSO</button>{providers.map((provider) => <button key={provider.id} onClick={() => loginSso(provider).catch((nextError) => toast(nextError.message, "error"))}>Continue with {provider.label}</button>)}</div><div className="meta">{firebaseConfigured() ? "Firebase verifies every Google, SAML, and OIDC ID token before workspace authorization." : "Firebase client config is missing from this build."}</div><details><summary>Use a service token</summary><label>Bearer token<input value={token} onChange={(event) => setToken(event.target.value)} placeholder="Paste service token" /></label><button disabled={!token.trim() || busy} onClick={() => useToken().catch((tokenError) => toast(tokenError instanceof Error ? tokenError.message : "Token rejected", "error"))}>Continue with token</button></details>{error && !/signed out/i.test(error) && <div className="warn">Sign-in check: {error}</div>}</div><div className="toastStack">{toasts.map((row) => <div key={row.id} className={`toast ${row.type ?? ""}`}>{row.message}</div>)}</div></div>;
+}
+
+function SubscriptionGate({ billing, refresh, logout, toast, toasts }: { billing: BillingAccess; refresh: () => Promise<void>; logout: () => Promise<void>; toast: (message: string, type?: Toast["type"]) => void; toasts: Toast[] }): React.ReactElement {
+  const params = new URLSearchParams(window.location.search);
+  const requested = params.get("plan") === "personal" ? "personal" : params.get("plan") === "team" ? "team" : "pro";
+  const offer = params.get("offer") === "producthunt" ? "producthunt" : undefined;
+  const checkoutState = params.get("checkout");
+  const [busy, setBusy] = useState<"personal" | "pro" | "team" | "">("");
+  const [teamName, setTeamName] = useState("");
+  const [seats, setSeats] = useState(2);
+  const [organizations, setOrganizations] = useState<HostedOrganization[]>([]);
+  useEffect(() => { listOrganizations().then(setOrganizations).catch(() => null); }, []);
+  const buy = async (plan: "personal" | "pro" | "team"): Promise<void> => {
+    if (plan === "team" && !apiClient.getWorkspace().tenantId && teamName.trim().length < 2) throw new Error("Enter your team name before opening Checkout.");
+    setBusy(plan);
+    try {
+      const session = await startCheckout(plan, offer, plan === "team" ? { organizationName: teamName, seats } : undefined);
+      if (session.organizationId && session.spaceId) apiClient.setWorkspace(session.organizationId, session.spaceId);
+      window.location.assign(session.url);
+    } finally {
+      setBusy("");
+    }
+  };
+  const openOrganization = async (organization: HostedOrganization): Promise<void> => {
+    const space = organization.spaces[0];
+    if (!space) throw new Error("This team has no active space.");
+    apiClient.setWorkspace(organization.id, space.id);
+    await refresh();
+  };
+  return <div className="authScreen"><div className="authPanel subscriptionPanel"><h1 className="appBrand"><img src="/assets/icon.svg" alt="" width="34" height="34" /><span>NeuraKeep</span></h1><h2>Choose your hosted plan</h2><p>Your account is signed in. Choose an individual vault or a licensed Team workspace.</p>{checkoutState === "success" && <div className="successNotice">Payment received. Stripe is confirming your subscription now.</div>}{checkoutState === "cancelled" && <div className="warn">Checkout was cancelled. Nothing was charged.</div>}{organizations.length > 0 && <div className="existingTeams"><b>Your teams</b>{organizations.map((organization) => <button key={organization.id} onClick={() => openOrganization(organization).catch((error) => toast(error.message, "error"))}>{organization.name} · {organization.status}</button>)}</div>}{billing.launchOffer.configured && <div className="launchOffer"><b>Product Hunt launch: 50% off your first three months</b><span>Offer code {billing.launchOffer.code} is applied automatically from the launch link.</span></div>}<div className="subscriptionPlans">{billing.plans.map((plan) => <article className={plan.id === requested ? "subscriptionPlan selected" : "subscriptionPlan"} key={plan.id}><h3>{plan.name}</h3><div className="subscriptionPrice">${plan.amount}<span>{plan.id === "team" ? "/user/month" : "/month"}</span></div><p>{plan.id === "personal" ? "Private hosted memory, remote MCP, service tokens, and backups." : plan.id === "pro" ? "Higher limits for consultants, heavy AI users, PDFs, OCR, and advanced graph workflows." : "Shared spaces, roles, team review, audit history, and enterprise identity options."}</p>{plan.id === "team" && <div className="teamCheckoutFields"><label>Team name<input value={teamName} onChange={(event) => setTeamName(event.target.value)} placeholder="Acme AI" /></label><label>Licensed seats<input type="number" min={2} max={250} value={seats} onChange={(event) => setSeats(Math.max(2, Math.min(250, Number(event.target.value))))} /></label></div>}<button disabled={!plan.configured || Boolean(busy)} onClick={() => buy(plan.id).catch((error) => toast(error.message, "error"))}>{busy === plan.id ? "Opening Stripe..." : plan.configured ? `Choose ${plan.name}` : "Coming soon"}</button></article>)}</div><div className="proposalTools"><button onClick={() => refresh().catch((error) => toast(error.message, "error"))}>Refresh subscription</button><button className="secondary" onClick={() => logout().catch((error) => toast(error.message, "error"))}>Sign out</button></div><a className="meta" href="https://github.com/dominiclachance/neurakeep">Prefer local? Use the open-source core free.</a></div><div className="toastStack">{toasts.map((row) => <div key={row.id} className={`toast ${row.type ?? ""}`}>{row.message}</div>)}</div></div>;
+}
+
+function HostedCard({ auth }: { auth: AuthSettings | null }): React.ReactElement {
+  const hosted = auth?.hosted;
+  return <><HostedAccessTokensCard auth={auth} /><div className="viewCard"><h3>Hosted Foundation</h3><div className="chips"><span>{hosted?.enabled ? "enabled" : "disabled"}</span><span>{hosted?.authProvider ?? "local"}</span><span>{hosted?.firebaseProjectId ?? "no Firebase project"}</span><span>{hosted?.tenantId ?? "account pending"}</span></div><div className="meta">Hosted mode uses Google ID tokens verified through Firebase Auth, an account-isolated vault, tenant-bound MCP tokens, Stripe entitlements, and server-side audit events.</div><pre>{JSON.stringify(hosted ?? {}, null, 2)}</pre></div></>;
+}
+
+function HostedAccessTokensCard({ auth }: { auth: AuthSettings | null }): React.ReactElement {
+  const [tokens, setTokens] = useState<HostedAccessToken[]>([]);
+  const [issued, setIssued] = useState("");
+  const [name, setName] = useState("My MCP connector");
+  const [error, setError] = useState("");
+  const refresh = useCallback(() => listHostedTokens().then(setTokens).catch((nextError) => setError(nextError.message)), []);
+  useEffect(() => { if (auth?.provider === "firebase") void refresh(); }, [auth?.provider, refresh]);
+  if (auth?.provider !== "firebase") return <></>;
+  const create = async (): Promise<void> => {
+    const result = await createHostedToken(name);
+    setIssued(result.token);
+    setError("");
+    await refresh();
+  };
+  const revoke = async (id: string): Promise<void> => {
+    await revokeHostedToken(id);
+    await refresh();
+  };
+  return <div className="viewCard"><h3>Remote MCP access</h3><div className="meta">Create a tenant-bound token for Claude, Codex, OpenClaw, or another MCP client. It can access only this account's isolated vault.</div><label>Token name<input value={name} onChange={(event) => setName(event.target.value)} /></label><button onClick={() => create().catch((nextError) => setError(nextError.message))}>Create access token</button>{issued && <div className="result"><b>Copy this token now—it will not be shown again.</b><pre>{issued}</pre><button onClick={() => navigator.clipboard.writeText(issued)}>Copy token</button></div>}{tokens.map((token) => <div className="result" key={token.id}><b>{token.name}</b><div className="meta">Created {new Date(token.createdAt).toLocaleDateString()}{token.lastUsedAt ? ` / last used ${new Date(token.lastUsedAt).toLocaleString()}` : " / never used"}{token.revokedAt ? " / revoked" : ""}</div>{!token.revokedAt && <button className="secondary" onClick={() => revoke(token.id).catch((nextError) => setError(nextError.message))}>Revoke</button>}</div>)}{error && <div className="warn">{error}</div>}</div>;
+}
+
+function BillingCard({ billing, toast }: { billing: BillingAccess | null; toast: (message: string, type?: Toast["type"]) => void }): React.ReactElement {
+  const manage = async (): Promise<void> => {
+    const portal = await openBillingPortal();
+    window.location.assign(portal.url);
+  };
+  return <div className="viewCard"><h3>Subscription</h3><div className="chips"><span>{billing?.plan ?? "local"}</span><span>{billing?.status ?? "active"}</span>{billing?.currentPeriodEnd && <span>renews {new Date(billing.currentPeriodEnd).toLocaleDateString()}</span>}</div><div className="meta">Stripe manages payment methods, invoices, and cancellation. Contact support to change plans.</div>{billing?.customerId ? <button onClick={() => manage().catch((error) => toast(error.message, "error"))}>Manage billing</button> : null}</div>;
 }
 
 function IntegrationStatusCard({ status }: { status: Record<string, any> | null }): React.ReactElement {
   const clients = status?.clients ?? [];
-  return <div className="viewCard"><h3>Client Integrations</h3><div className="chips"><span>{status?.server?.mode ?? "loading"}</span><span>{status?.tools?.length ?? 0} tools</span><span>{status?.server?.tokenRequired ? "token required" : "local open"}</span></div>{clients.map((client: Record<string, unknown>) => <div className="result" key={String(client.name)}><b>{String(client.name)}</b><div className="meta">{client.configured === null ? String(client.note) : client.configured ? "Configured" : "Not configured"}{client.configPath ? ` / ${String(client.configPath)}` : ""}</div></div>)}<pre>{JSON.stringify(status?.smokeTests ?? [], null, 2)}</pre></div>;
+  const remote = status?.remoteMcp ?? {};
+  return <div className="viewCard"><h3>Client Integrations</h3><div className="chips"><span>{status?.server?.mode ?? "loading"}</span><span>{status?.tools?.length ?? 0} tools</span><span>{status?.server?.tokenRequired ? "token required" : "local open"}</span><span>{remote.serviceTokenConfigured ? "service token ready" : "no service token"}</span></div><div className="meta">{remote.endpoint ?? "Remote MCP endpoint not loaded."}</div>{remote.protectedResourceMetadata && <div className="meta">{remote.protectedResourceMetadata}</div>}{clients.map((client: Record<string, unknown>) => <div className="result" key={String(client.name)}><b>{String(client.name)}</b><div className="meta">{client.configured === null ? String(client.note) : client.configured ? "Configured" : "Not configured"}{client.configPath ? ` / ${String(client.configPath)}` : ""}</div></div>)}<pre>{JSON.stringify(status?.smokeTests ?? [], null, 2)}</pre></div>;
+}
+
+function HostedOpsCard({ ops }: { ops: Record<string, any> | null }): React.ReactElement {
+  const recent = ops?.recentAuditEvents ?? [];
+  return <div className="viewCard"><h3>Monitoring / Backups</h3><div className="chips"><span>{ops?.health?.storageOk ? "storage ok" : "storage check"}</span><span>{ops?.backup?.configured ? "backup configured" : "backup path only"}</span><span>{ops?.alerting?.webhookConfigured ? "alerts hooked" : "webhook missing"}</span><span>{ops?.serviceTokens?.configured ? "service tokens live" : "no service tokens"}</span></div><div className="meta">{ops?.backup?.verification ?? "Ops status loading."}</div><div className="meta">{ops?.serviceTokens?.rotateWith ?? ""}</div>{recent.slice(0, 5).map((row: Record<string, unknown>) => <div className="result" key={String(row.id)}><b>{String(row.action)} / {String(row.status)}</b><div className="meta">{String(row.createdAt)} / {String(row.actorEmail ?? row.actorUid)}</div></div>)}</div>;
 }
 
 function DailyLoopCard({ status, run }: { status: Record<string, any> | null; run: () => void }): React.ReactElement {
@@ -1000,6 +1478,94 @@ function PhysicsControls({ state, setGraph }: { state: GraphState; setGraph: Rea
   const physics: PhysicsSettings = { ...defaultPhysics, ...(state.physics ?? {}) };
   const set = (key: keyof PhysicsSettings, value: number) => setGraph((current) => ({ ...current, state: { ...current.state, physics: { ...physics, [key]: value } } }));
   return <div className="physics"><label>Repel<input type="range" min="600" max="3200" value={physics.repulsion} onChange={(event) => set("repulsion", Number(event.target.value))} /></label><label>Links<input type="range" min="80" max="260" value={physics.linkDistance} onChange={(event) => set("linkDistance", Number(event.target.value))} /></label></div>;
+}
+
+function rootOverviewPayload(data: GraphPayload): GraphPayload {
+  return {
+    ...data,
+    state: {
+      ...(data.state ?? {}),
+      mode: "all",
+      collapsed: [],
+      collapsedBranches: []
+    }
+  };
+}
+
+function treeWorldSize(nodes: GraphNode[], edges: GraphEdge[], viewportWidth: number, viewportHeight: number): { width: number; height: number } {
+  const levels = treeLevels(nodes, edges);
+  const maxRows = Math.max(1, ...levels.map((level) => level.length));
+  return {
+    width: Math.max(viewportWidth, levels.length * 280 + 180, viewportWidth * 1.4),
+    height: Math.max(viewportHeight, maxRows * 82 + 140, viewportHeight * 1.2)
+  };
+}
+
+function computeTreeLayout(nodes: GraphNode[], edges: GraphEdge[], width: number, height: number, selectedId: string): Map<string, LayoutPoint> {
+  const levels = treeLevels(nodes, edges, selectedId);
+  const positions = new Map<string, LayoutPoint>();
+  const columnGap = Math.max(220, Math.min(320, (width - 160) / Math.max(1, levels.length - 1)));
+  levels.forEach((level, depth) => {
+    const sorted = [...level].sort(compareTreeNodes);
+    const rowGap = Math.max(58, Math.min(96, (height - 120) / Math.max(1, sorted.length + 1)));
+    const startY = height / 2 - ((sorted.length - 1) * rowGap) / 2;
+    sorted.forEach((node, index) => {
+      positions.set(node.id, {
+        x: 90 + depth * columnGap,
+        y: startY + index * rowGap
+      });
+    });
+  });
+  return positions;
+}
+
+function treeLevels(nodes: GraphNode[], edges: GraphEdge[], selectedId = ""): GraphNode[][] {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  if (nodes.length === 0) return [];
+  const rootId = nodeById.has("root:neurakeep")
+    ? "root:neurakeep"
+    : selectedId && nodeById.has(selectedId)
+      ? selectedId
+      : nodes.find((node) => node.type === "root")?.id ?? nodes[0].id;
+  const children = new Map<string, string[]>();
+  const undirected = new Map<string, string[]>();
+  for (const edge of edges) {
+    children.set(edge.from, [...(children.get(edge.from) ?? []), edge.to]);
+    undirected.set(edge.from, [...(undirected.get(edge.from) ?? []), edge.to]);
+    undirected.set(edge.to, [...(undirected.get(edge.to) ?? []), edge.from]);
+  }
+  const levels: GraphNode[][] = [];
+  const visited = new Set<string>();
+  const queue: Array<{ id: string; depth: number }> = [{ id: rootId, depth: 0 }];
+  while (queue.length > 0) {
+    const item = queue.shift()!;
+    if (visited.has(item.id)) continue;
+    const node = nodeById.get(item.id);
+    if (!node) continue;
+    visited.add(item.id);
+    levels[item.depth] = [...(levels[item.depth] ?? []), node];
+    const nextIds = children.get(item.id)?.length ? children.get(item.id)! : undirected.get(item.id) ?? [];
+    for (const next of nextIds) {
+      if (!visited.has(next) && nodeById.has(next)) queue.push({ id: next, depth: item.depth + 1 });
+    }
+  }
+  const unvisited = nodes.filter((node) => !visited.has(node.id));
+  if (unvisited.length > 0) levels.push(unvisited);
+  return levels.filter((level) => level.length > 0);
+}
+
+function compareTreeNodes(a: GraphNode, b: GraphNode): number {
+  const typeOrder: Record<GraphNode["type"], number> = { root: 0, source: 1, section: 2, event: 3, fact: 4, failure: 5 };
+  const rootOrder: Record<string, number> = {
+    "root:neurakeep": 0,
+    "root:sources": 1,
+    "root:sections": 2,
+    "root:decisions": 3,
+    "root:facts": 4,
+    "root:failures": 5
+  };
+  return (rootOrder[a.id] ?? typeOrder[a.type] ?? 99) - (rootOrder[b.id] ?? typeOrder[b.type] ?? 99)
+    || a.label.localeCompare(b.label);
 }
 
 function graphModeIds(graph: GraphPayload, mode: string, selectedId: string, focusIds: Set<string> | null): Set<string> | null {
@@ -1207,6 +1773,14 @@ function recordText(record: MemoryRecord): string {
   return record.summary ?? JSON.stringify(record, null, 2);
 }
 
+function plainWarning(message: string): string {
+  return message
+    .replace(/generic_api_key/gi, "possible placeholder or exposed API key")
+    .replace(/prompt[_ -]?injection/gi, "possible prompt injection")
+    .replace(/secret/gi, "sensitive secret")
+    .replace(/blocked/gi, "blocked until reviewed");
+}
+
 function parseArray(value: unknown): string[] {
   try {
     const parsed = JSON.parse(String(value ?? "[]")) as unknown;
@@ -1228,14 +1802,39 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
-function title(value: string): string {
+function textToBase64(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary);
+}
+
+function copyText(value: string, toast: (message: string, type?: Toast["type"]) => void): void {
+  navigator.clipboard?.writeText(value)
+    .then(() => toast("Copied"))
+    .catch(() => toast("Copy failed", "error"));
+}
+
+function readGraphViews(): GraphSavedView[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem("neurakeep_graph_views") ?? "[]") as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is GraphSavedView => Boolean((item as GraphSavedView).name && (item as GraphSavedView).view)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function routeLabel(value: RouteName): string {
+  if (value === "proposals") return "Props";
+  if (value === "connect") return "MCP";
+  if (value === "activity") return "Audit";
   return value.slice(0, 1).toUpperCase() + value.slice(1);
 }
 
 function routeFromHash(): RouteName {
   const route = window.location.hash.replace(/^#/, "");
   if (route === "props") return "proposals";
-  return ["graph", "search", "inbox", "proposals", "quality", "settings"].includes(route) ? route as RouteName : "graph";
+  return ["graph", "search", "inbox", "proposals", "connect", "activity", "quality", "settings"].includes(route) ? route as RouteName : "graph";
 }
 
 interface SearchResult {
@@ -1257,6 +1856,13 @@ interface RetrievalGuidance {
 }
 
 type MemoryRecord = Record<string, any>;
+
+interface GraphSavedView {
+  name: string;
+  view: { x: number; y: number; scale: number };
+  selectedId: string;
+  state: GraphState;
+}
 
 interface SearchFilters {
   dateFrom: string;

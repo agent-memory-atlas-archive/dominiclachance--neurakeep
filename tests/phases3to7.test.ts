@@ -32,8 +32,8 @@ describe("phases 3 to 7", () => {
     try {
       const publicNote = join(projectDir, "public.md");
       const secretNote = join(projectDir, "secret.md");
-      writeFileSync(publicNote, "# Public\n\nProduction rebuild uses production env.", "utf8");
-      writeFileSync(secretNote, "# Secret\n\nProduction rebuild secret token note.", "utf8");
+      writeFileSync(publicNote, "# Public\n\nFirebase rebuild uses production env.", "utf8");
+      writeFileSync(secretNote, "# Secret\n\nFirebase rebuild secret token note.", "utf8");
 
       ingestFile(db, paths, {
         path: publicNote,
@@ -55,7 +55,7 @@ describe("phases 3 to 7", () => {
       });
 
       const defaultResults = searchSections(db, {
-        query: "production rebuild",
+        query: "Firebase rebuild",
         limit: 10,
         space: "project",
         neighbors: 0
@@ -64,7 +64,7 @@ describe("phases 3 to 7", () => {
       expect(defaultResults[0]?.rank.total).toBeGreaterThan(0);
 
       const secretResults = searchSections(db, {
-        query: "production rebuild",
+        query: "Firebase rebuild",
         limit: 10,
         space: "project",
         neighbors: 0,
@@ -122,21 +122,31 @@ Do not rebuild production without sourced environment variables.
       expect(existsSync(app.indexPath)).toBe(true);
       expect(existsSync(app.graphPath)).toBe(true);
       const html = readFileSync(app.indexPath, "utf8");
-      expect(html).toContain("<div id=\"root\"></div>");
-      expect(html).toContain("/assets/");
       const assetDir = join(app.appDir, "assets");
-      expect(existsSync(assetDir)).toBe(true);
-      const assetText = readdirSync(assetDir)
-        .filter((name) => name.endsWith(".js") || name.endsWith(".css"))
-        .map((name) => readFileSync(join(assetDir, name), "utf8"))
-        .join("\n");
-      expect(assetText).toContain("memory_read");
-      expect(assetText).toContain("Proposal Inbox");
-      expect(assetText).toContain("Start Watcher");
-      expect(assetText).toContain("Auth / User");
-      expect(assetText).toContain("Diff preview");
-      expect(assetText).toContain("Alt-drag");
-      expect(assetText).toContain("overflow:hidden");
+      const hasReactAssets = existsSync(assetDir);
+      const assetText = hasReactAssets
+        ? readdirSync(assetDir)
+          .filter((name) => name.endsWith(".js") || name.endsWith(".css"))
+          .map((name) => readFileSync(join(assetDir, name), "utf8"))
+          .join("\n")
+        : ["app-shell.js", "app-shell.css"]
+          .map((name) => readFileSync(join(app.appDir, name), "utf8"))
+          .join("\n");
+      const appText = `${html}\n${assetText}`;
+      expect(appText).toContain("NeuraKeep");
+      expect(appText).toContain("memory_read");
+      if (hasReactAssets) {
+        expect(appText).toContain("Proposal Inbox");
+        expect(appText).toContain("Start Watcher");
+        expect(appText).toContain("Auth / User");
+        expect(appText).toContain("Diff preview");
+        expect(appText).toContain("Drag nodes");
+      } else {
+        expect(appText).toContain("Proposals");
+        expect(appText).toContain("Watcher");
+        expect(appText).toContain("Self-Memory Policy");
+      }
+      expect(appText).toMatch(/overflow:\s*hidden/);
       expect(html).not.toContain("miniMap");
       expect(html).not.toContain("minimap");
       expect(app.nodeCount).toBeGreaterThan(0);

@@ -54,7 +54,7 @@ export function proposeSourceExtraction(
   }
 
   const input = loadExtractionInput(db, sourceId);
-  const diff =
+  const rawDiff =
     options.extractor === "command"
       ? runCommandExtractor(input, {
           command:
@@ -63,6 +63,7 @@ export function proposeSourceExtraction(
             failMissingExtractorCommand()
         })
       : input.deterministicDraft;
+  const diff = normalizeProposalDiff(rawDiff);
   validateProposalDiff(diff);
   const governor = governProposalDiff(db, diff);
   const extractionScore = scoreExtraction(diff, input.deterministicDraft);
@@ -74,7 +75,8 @@ export function proposeSourceExtraction(
     ...diff.facts.flatMap((fact) => fact.sectionIds),
     ...diff.failures.flatMap((failure) => failure.sectionIds)
   ]);
-  const summary = `Extract ${diff.events.length} events, ${diff.facts.length} facts, and ${diff.failures.length} failures from ${source.title ?? source.id}.`;
+  const qualityLabel = extractionScore.gate.passed && extractionScore.warnings.length === 0 ? "clean" : "review";
+  const summary = `Extract ${diff.events.length} events, ${diff.facts.length} facts, and ${diff.failures.length} failures from ${source.title ?? source.id} (${qualityLabel}: ${extractionScore.warnings.length} warnings).`;
 
   db.prepare(
     `
@@ -120,6 +122,52 @@ function failMissingExtractorCommand(): never {
   throw new Error(
     "Command extractor requires --extractor-command or NEURAKEEP_EXTRACTOR_CMD."
   );
+}
+
+function normalizeProposalDiff(diff: ExtractedMemory): ExtractedMemory {
+  return {
+    events: dedupeKeepBest(
+      diff.events.filter((event) => usefulText(event.summary, 12)),
+      (event) => `event:${normalizeKey(event.summary)}`
+    ),
+    facts: dedupeKeepBest(
+      diff.facts.filter((fact) => usefulText(fact.subject, 3) && usefulText(fact.predicate, 2) && usefulText(fact.object, 8) && !isNoisyFactCandidate(fact)),
+      (fact) => `fact:${normalizeKey(fact.subject)}|${normalizeKey(fact.predicate)}|${normalizeKey(fact.object)}`
+    ),
+    failures: dedupeKeepBest(
+      diff.failures.filter((failure) => usefulText(failure.attempted, 8) && usefulText(failure.doNotRepeat, 12)),
+      (failure) => `failure:${normalizeKey(failure.attempted)}|${normalizeKey(failure.doNotRepeat)}`
+    )
+  };
+}
+
+function dedupeKeepBest<T extends { confidence: number }>(items: T[], keyFor: (item: T) => string): T[] {
+  const byKey = new Map<string, T>();
+  for (const item of items) {
+    const key = keyFor(item);
+    const existing = byKey.get(key);
+    if (!existing || item.confidence > existing.confidence) {
+      byKey.set(key, item);
+    }
+  }
+  return Array.from(byKey.values());
+}
+
+function isNoisyFactCandidate(fact: ExtractedMemory["facts"][number]): boolean {
+  const subject = normalizeKey(fact.subject);
+  const object = normalizeKey(fact.object);
+  if (subject === "source" && /^https?:\/\//i.test(fact.object)) return true;
+  if (/^(this|that|it|thing|note|notes?)$/.test(subject)) return true;
+  if (/^(yes|no|ok|todo|tbd|n\/a)$/.test(object)) return true;
+  return false;
+}
+
+function usefulText(value: string, minLength: number): boolean {
+  return value.replace(/\s+/g, " ").trim().length >= minLength;
+}
+
+function normalizeKey(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 export function applyProposal(

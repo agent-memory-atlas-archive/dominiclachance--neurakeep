@@ -1,37 +1,24 @@
 {
   "name": "neurakeep",
-  "version": "0.1.0",
-  "mcpName": "io.github.dominiclachance/neurakeep",
+  "version": "0.2.0",
   "description": "NeuraKeep: local-first, source-cited memory for AI agents.",
   "type": "module",
   "bin": {
     "neurakeep": "dist/cli/index.js",
     "umos": "dist/cli/index.js"
   },
-  "files": [
-    "dist",
-    "docs",
-    "README.md",
-    "LICENSE"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/dominiclachance/neurakeep.git"
-  },
-  "homepage": "https://www.neurakeep.com/mcp-server-directory/",
-  "bugs": {
-    "url": "https://github.com/dominiclachance/neurakeep/issues"
-  },
   "scripts": {
     "build": "tsc",
     "build:web": "vite build",
     "build:all": "npm run build && npm run build:web",
+    "check:secrets": "node scripts/security-scan.mjs",
+    "release:check": "node scripts/release-check.mjs",
     "dev": "tsx src/cli/index.ts",
     "dev:web": "vite --host 127.0.0.1 --port 5176",
     "e2e": "npm run build:all && node dist/cli/index.js init --root .umos && node dist/cli/index.js app --root .umos && playwright test",
     "test": "vitest run --config vitest.config.ts",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck && npm run build:all && npm test"
+    "prepublishOnly": "npm run release:check && npm run typecheck && npm run build:all && npm test"
   },
   "keywords": [
     "memory",
@@ -61,5 +48,21 @@
     "typescript": "^5.9.3",
     "vite": "^8.1.3",
     "vitest": "^4.0.14"
+  },
+  "mcpName": "io.github.dominiclachance/neurakeep",
+  "files": [
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE",
+    "server.json"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dominiclachance/neurakeep.git"
+  },
+  "homepage": "https://www.neurakeep.com/",
+  "bugs": {
+    "url": "https://github.com/dominiclachance/neurakeep/issues"
   }
 }

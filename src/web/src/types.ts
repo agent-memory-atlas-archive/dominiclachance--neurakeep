@@ -1,4 +1,4 @@
-export type RouteName = "graph" | "search" | "inbox" | "proposals" | "quality" | "settings";
+export type RouteName = "graph" | "search" | "inbox" | "proposals" | "connect" | "activity" | "quality" | "settings";
 
 export interface GraphNode {
   id: string;
@@ -17,6 +17,7 @@ export interface GraphEdge {
 
 export interface GraphState {
   mode?: string;
+  layoutMode?: "graph" | "tree";
   clusterBy?: string;
   edgeTypes?: string[];
   layout?: Record<string, { x: number; y: number; pinned?: boolean }>;

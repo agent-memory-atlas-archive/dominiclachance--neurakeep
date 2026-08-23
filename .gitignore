@@ -2,10 +2,13 @@ node_modules/
 dist/
 web-dist/
 .umos/
+.umos*/
 marketing-site/
 *.log
 *.tgz
 *.zip
+*.tar
+*.tar.gz
 .env
 .env.*
 !.env.example
@@ -13,10 +16,21 @@ marketing-site/
 *.key
 *.p12
 *.pfx
+*.crt
+*.cert
+service-account*.json
+firebase-adminsdk*.json
+*-firebase-adminsdk-*.json
 firebase-debug.log
 test-results/
 playwright-report/
 blob-report/
+coverage/
+raw/
+episodes/
+vault/
+exports/
+release/
 
 # Internal planning / commercial launch notes are not part of the public local-install repo.
 ARCHITECTURE.md

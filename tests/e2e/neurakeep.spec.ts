@@ -3,9 +3,15 @@ import { expect, test } from "@playwright/test";
 test("NeuraKeep routed React app core flows", async ({ page }) => {
   await page.goto("/index.html");
   await expect(page.getByRole("heading", { name: "NeuraKeep" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Log out" })).toBeVisible();
   await expect(page.getByTestId("graph-svg")).toBeVisible();
+  await expect(page.locator(".toolbar input")).toHaveValue("");
+  await page.getByRole("button", { name: "Tree" }).click();
+  await expect(page.getByRole("button", { name: "Tree" })).toHaveClass(/activeControl/);
+  await expect(page.locator(".graphSavedPanel")).toBeVisible();
   await page.screenshot({ path: "test-results/neurakeep-graph-react.png", fullPage: true });
 
+  await page.locator(".toolbar input").fill("NeuraKeep");
   await page.locator(".toolbar").getByRole("button", { name: "Search" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Search Results" })).toBeVisible();
@@ -25,6 +31,7 @@ test("NeuraKeep routed React app core flows", async ({ page }) => {
   })).toBe(true);
   await page.screenshot({ path: "test-results/neurakeep-search-modal-react.png", fullPage: true });
   await page.getByRole("button", { name: "Close" }).click();
+  await page.locator(".citationPreview").evaluateAll((elements) => elements.forEach((element) => element.remove()));
 
   await page.getByRole("button", { name: "Props" }).click();
   await expect(page.getByRole("heading", { name: "Proposal Inbox" })).toBeVisible();
@@ -33,9 +40,13 @@ test("NeuraKeep routed React app core flows", async ({ page }) => {
   await page.getByRole("button", { name: "Settings" }).click();
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
   await expect(page.getByText("Auth / User")).toBeVisible();
-  await page.getByLabel("Display name").fill("Local NeuraKeep User");
+  await page.getByLabel("Display name").fill("QA NeuraKeep User");
+  const saveResponse = page.waitForResponse((response) =>
+    response.url().includes("/api/auth/settings") && response.request().method() === "POST"
+  );
   await page.getByRole("button", { name: "Save auth settings" }).click();
-  await expect(page.getByText("Auth settings saved")).toBeVisible();
+  expect((await saveResponse).ok()).toBe(true);
+  await expect(page.getByLabel("Display name")).toHaveValue("QA NeuraKeep User");
   await page.screenshot({ path: "test-results/neurakeep-settings-react.png", fullPage: true });
 });
 
@@ -47,6 +58,8 @@ test("routes stay viewport locked with no minimap", async ({ page }) => {
     { hash: "search", marker: 'h2:has-text("Search")' },
     { hash: "inbox", marker: 'h2:has-text("Inbox")' },
     { hash: "proposals", marker: 'h2:has-text("Proposal Inbox")' },
+    { hash: "connect", marker: 'h2:has-text("MCP Connection")' },
+    { hash: "activity", marker: 'h2:has-text("Activity")' },
     { hash: "quality", marker: 'h2:has-text("Quality")' },
     { hash: "settings", marker: 'h2:has-text("Settings")' }
   ];
@@ -80,4 +93,37 @@ test("routes stay viewport locked with no minimap", async ({ page }) => {
       route: route.hash
     });
   }
+});
+
+test("GA4 CTA events fire on hosted app interactions", async ({ page }) => {
+  await page.addInitScript(() => {
+    const events: unknown[][] = [];
+    (window as unknown as { __gaEvents: unknown[][] }).__gaEvents = events;
+    (window as unknown as { gtag: (...args: unknown[]) => void }).gtag = (...args: unknown[]) => {
+      events.push(args);
+    };
+  });
+  await page.goto("/index.html");
+  await expect(page.getByRole("button", { name: "Log out" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Inbox" }).click();
+  await page.getByRole("button", { name: "Import first-run sample" }).click();
+  await expect.poll(async () => page.evaluate(() =>
+    (window as unknown as { __gaEvents: unknown[][] }).__gaEvents
+      .filter((entry) => entry[0] === "event")
+      .map((entry) => entry[1])
+  )).toContain("demo_sample_import_click");
+
+  await page.getByRole("button", { name: "Log out" }).click();
+  await expect.poll(async () => page.evaluate(() =>
+    (window as unknown as { __gaEvents: unknown[][] }).__gaEvents
+      .filter((entry) => entry[0] === "event")
+      .map((entry) => entry[1])
+  )).toContain("hosted_logout_click");
+
+  const payload = await page.evaluate(() =>
+    (window as unknown as { __gaEvents: unknown[][] }).__gaEvents
+      .find((entry) => entry[1] === "demo_sample_import_click")?.[2]
+  );
+  expect(payload).toMatchObject({ section: "inbox", app_surface: "hosted_app" });
 });

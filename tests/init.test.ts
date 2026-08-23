@@ -41,7 +41,16 @@ describe("umos init", () => {
         facts: 0,
         failures: 0,
         proposals: 0,
-        eval_cases: 0
+        eval_cases: 0,
+        hosted_tenants: 0,
+        hosted_spaces: 0,
+        hosted_memberships: 0,
+        hosted_organizations: 0,
+        hosted_org_memberships: 0,
+        hosted_org_spaces: 0,
+        hosted_org_invitations: 0,
+        hosted_audit_events: 0,
+        hosted_access_tokens: 0
       });
     } finally {
       db.close();

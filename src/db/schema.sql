@@ -228,3 +228,180 @@ CREATE TABLE IF NOT EXISTS eval_cases (
 
 CREATE INDEX IF NOT EXISTS idx_eval_cases_space
 ON eval_cases(space);
+
+CREATE TABLE IF NOT EXISTS hosted_tenants (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  plan TEXT NOT NULL DEFAULT 'free',
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS hosted_spaces (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES hosted_tenants(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'personal',
+  created_at TEXT NOT NULL,
+  policy_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_spaces_tenant
+ON hosted_spaces(tenant_id);
+
+CREATE TABLE IF NOT EXISTS hosted_memberships (
+  tenant_id TEXT NOT NULL REFERENCES hosted_tenants(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  email TEXT,
+  display_name TEXT,
+  roles_json TEXT NOT NULL DEFAULT '[]',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (tenant_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS hosted_audit_events (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  tenant_id TEXT NOT NULL,
+  space_id TEXT NOT NULL,
+  actor_provider TEXT NOT NULL,
+  actor_uid TEXT NOT NULL,
+  actor_email TEXT,
+  action TEXT NOT NULL,
+  target_type TEXT NOT NULL,
+  target_id TEXT,
+  status TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_audit_tenant_created
+ON hosted_audit_events(tenant_id, created_at);
+
+CREATE TABLE IF NOT EXISTS hosted_subscriptions (
+  user_id TEXT PRIMARY KEY,
+  email TEXT,
+  stripe_customer_id TEXT,
+  stripe_subscription_id TEXT UNIQUE,
+  stripe_price_id TEXT,
+  plan TEXT NOT NULL DEFAULT 'none',
+  status TEXT NOT NULL DEFAULT 'inactive',
+  current_period_end TEXT,
+  cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_subscriptions_customer
+ON hosted_subscriptions(stripe_customer_id);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_subscriptions_email
+ON hosted_subscriptions(email);
+
+CREATE TABLE IF NOT EXISTS hosted_organizations (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  slug TEXT NOT NULL UNIQUE,
+  owner_user_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending_checkout',
+  plan TEXT NOT NULL DEFAULT 'team',
+  seat_count INTEGER NOT NULL DEFAULT 2,
+  stripe_customer_id TEXT,
+  stripe_subscription_id TEXT UNIQUE,
+  stripe_price_id TEXT,
+  current_period_end TEXT,
+  cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
+  policy_json TEXT NOT NULL DEFAULT '{}',
+  sso_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_organizations_owner
+ON hosted_organizations(owner_user_id, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_organizations_customer
+ON hosted_organizations(stripe_customer_id);
+
+CREATE TABLE IF NOT EXISTS hosted_org_memberships (
+  organization_id TEXT NOT NULL REFERENCES hosted_organizations(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  email TEXT,
+  display_name TEXT,
+  role TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (organization_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_org_memberships_user
+ON hosted_org_memberships(user_id, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS hosted_org_spaces (
+  id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL REFERENCES hosted_organizations(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  slug TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (organization_id, slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_org_spaces_org
+ON hosted_org_spaces(organization_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS hosted_org_invitations (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  organization_id TEXT NOT NULL REFERENCES hosted_organizations(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  role TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  expires_at TEXT NOT NULL,
+  accepted_by TEXT,
+  accepted_at TEXT,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_org_invitations_org
+ON hosted_org_invitations(organization_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS hosted_org_scim_tokens (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  organization_id TEXT NOT NULL REFERENCES hosted_organizations(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  last_used_at TEXT,
+  revoked_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS hosted_access_tokens (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  tenant_id TEXT NOT NULL,
+  space_id TEXT NOT NULL DEFAULT 'personal',
+  user_id TEXT NOT NULL,
+  email TEXT,
+  name TEXT NOT NULL,
+  roles_json TEXT NOT NULL DEFAULT '["mcp"]',
+  created_at TEXT NOT NULL,
+  last_used_at TEXT,
+  expires_at TEXT,
+  revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_access_tokens_owner
+ON hosted_access_tokens(tenant_id, user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  processed_at TEXT NOT NULL
+);

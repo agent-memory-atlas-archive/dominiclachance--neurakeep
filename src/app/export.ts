@@ -159,23 +159,6 @@ export function buildGraphView(
   const depth = Math.max(1, Math.min(Number(options.depth ?? 1), 3));
   const focusId = options.focusId?.trim() || null;
 
-  if (!focusId && full.nodes.length <= limit) {
-    return {
-      ...full,
-      hiddenNeighbors: {},
-      meta: {
-        totalNodes: full.nodes.length,
-        totalEdges: full.edges.length,
-        visibleNodes: full.nodes.length,
-        visibleEdges: full.edges.length,
-        focusId: null,
-        depth,
-        limit,
-        truncated: false
-      }
-    };
-  }
-
   const adjacency = new Map<string, string[]>();
   for (const edge of full.edges) {
     adjacency.set(edge.from, [...(adjacency.get(edge.from) ?? []), edge.to]);
@@ -246,27 +229,9 @@ function neighborhoodIds(focusId: string, adjacency: Map<string, string[]>, dept
 
 function overviewIds(nodes: GraphNode[], _edges: GraphEdge[], adjacency: Map<string, string[]>): Set<string> {
   const rootId = "root:neurakeep";
-  const ids = nodes.some((node) => node.id === rootId)
-    ? neighborhoodIds(rootId, adjacency, 2)
-    : new Set<string>();
-  const seeded = new Set(ids);
-  for (const id of seeded) {
-    if (!id.startsWith("root:")) continue;
-    const rankedNeighbors = (adjacency.get(id) ?? [])
-      .map((neighborId) => nodes.find((node) => node.id === neighborId))
-      .filter((node): node is GraphNode => Boolean(node))
-      .sort((a, b) => nodePriority(b) - nodePriority(a))
-      .slice(0, 35);
-    rankedNeighbors.forEach((node) => ids.add(node.id));
-  }
-  if (ids.size < 30) {
-    nodes
-      .filter((node) => node.type === "root" || node.type === "source")
-      .sort((a, b) => nodePriority(b) - nodePriority(a))
-      .slice(0, 45)
-      .forEach((node) => ids.add(node.id));
-  }
-  return ids;
+  return nodes.some((node) => node.id === rootId)
+    ? neighborhoodIds(rootId, adjacency, 1)
+    : new Set(nodes.filter((node) => node.type === "root").map((node) => node.id));
 }
 
 function nodePriority(node: GraphNode): number {
@@ -286,6 +251,7 @@ function addRootTopology(nodes: GraphNode[], edges: GraphEdge[], addNode: (node:
   const roots: GraphNode[] = [
     { id: "root:neurakeep", label: "NeuraKeep", type: "root", space: "system", trustLevel: "verified", sensitivity: "normal" },
     { id: "root:sources", label: "Sources", type: "root", space: "system", trustLevel: "verified", sensitivity: "normal" },
+    { id: "root:sections", label: "Sections", type: "root", space: "system", trustLevel: "verified", sensitivity: "normal" },
     { id: "root:decisions", label: "Decisions", type: "root", space: "system", trustLevel: "verified", sensitivity: "normal" },
     { id: "root:facts", label: "Facts", type: "root", space: "system", trustLevel: "verified", sensitivity: "normal" },
     { id: "root:failures", label: "Failures", type: "root", space: "system", trustLevel: "verified", sensitivity: "normal" }
@@ -296,6 +262,7 @@ function addRootTopology(nodes: GraphNode[], edges: GraphEdge[], addNode: (node:
   }
   for (const node of nodes) {
     if (node.type === "source") edges.push({ from: "root:sources", to: node.id, type: "root" });
+    if (node.type === "section") edges.push({ from: "root:sections", to: node.id, type: "root" });
     if (node.type === "event") edges.push({ from: "root:decisions", to: node.id, type: "root" });
     if (node.type === "fact") edges.push({ from: "root:facts", to: node.id, type: "root" });
     if (node.type === "failure") edges.push({ from: "root:failures", to: node.id, type: "root" });

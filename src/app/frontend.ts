@@ -210,7 +210,7 @@
   </aside>
   <main>
     <div class="toolbar">
-      <input id="memoryQuery" placeholder="Search memory" value="memory poisoning" />
+      <input id="memoryQuery" placeholder="Search memory" value="" />
       <button id="search" title="Open search results in a modal">Search</button>
       <button class="secondary" id="clear" title="Close the active modal">Clear</button>
     </div>

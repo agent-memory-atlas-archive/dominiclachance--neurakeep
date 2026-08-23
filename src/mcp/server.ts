@@ -4,6 +4,7 @@ import { migrateDatabase, openDatabase, type UmosDatabase } from "../db/client.j
 import { applyProposal, proposeSourceExtraction } from "../memory/proposals.js";
 import { explainSources, readMemoryRecord } from "../memory/records.js";
 import { retrievalGuidance, searchSections } from "../search/fts.js";
+import { NEURAKEEP_SERVER_INFO, neurakeepTools } from "./manifest.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -62,7 +63,7 @@ export function handleJsonRpcRequest(
     return makeResponse(request.id, {
       protocolVersion: "2025-03-26",
       capabilities: { tools: {} },
-      serverInfo: { name: "neurakeep", version: "0.0.1" }
+      serverInfo: { ...NEURAKEEP_SERVER_INFO }
     });
   }
 
@@ -132,64 +133,7 @@ function callTool(
 }
 
 function toolsList(): Array<Record<string, unknown>> {
-  return [
-    {
-      name: "memory_search",
-      description: "Search NeuraKeep memory with citations, confidence guidance, related failure warnings, and optional neighbor context.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          query: { type: "string" },
-          limit: { type: "number" },
-          neighbors: { type: "number" },
-          space: { type: "string" },
-          project: { type: "string" },
-          include_secret: { type: "boolean" }
-        },
-        required: ["query"]
-      }
-    },
-    {
-      name: "memory_read",
-      description: "Read a source, section, fact, event, failure, or proposal by ID.",
-      inputSchema: {
-        type: "object",
-        properties: { id: { type: "string" } },
-        required: ["id"]
-      }
-    },
-    {
-      name: "memory_explain_sources",
-      description: "Explain source citations, hashes, paths, timestamps, and snippets.",
-      inputSchema: {
-        type: "object",
-        properties: { source_ids: { type: "array", items: { type: "string" } } },
-        required: ["source_ids"]
-      }
-    },
-    {
-      name: "memory_propose_update",
-      description: "Create a pending cited structured-memory proposal from an ingested source.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          source_id: { type: "string" },
-          extractor: { type: "string" },
-          extractor_command: { type: "string" }
-        },
-        required: ["source_id"]
-      }
-    },
-    {
-      name: "memory_apply_update",
-      description: "Apply a pending proposal into durable memory and compile the wiki.",
-      inputSchema: {
-        type: "object",
-        properties: { proposal_id: { type: "string" } },
-        required: ["proposal_id"]
-      }
-    }
-  ];
+  return neurakeepTools();
 }
 
 function content(value: unknown): Record<string, unknown> {

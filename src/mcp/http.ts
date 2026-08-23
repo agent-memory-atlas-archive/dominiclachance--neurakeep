@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
@@ -43,13 +43,74 @@ import { queueSelfMemorySummary } from "../memory/self-loop.js";
 import { selfMemoryPolicy } from "../memory/self-policy.js";
 import { retrievalGuidance, searchSections, type SearchResult } from "../search/fts.js";
 import { handleJsonRpcRequest } from "./server.js";
+import { neurakeepServerCard } from "./manifest.js";
+import {
+  ensureHostedDefaults,
+  listHostedAudit,
+  listHostedAuditSummary,
+  listHostedMembers,
+  listHostedSpaces,
+  listRecentDeniedBetaAccess,
+  recordHostedAudit
+} from "../hosted/audit.js";
+import { betaAccessPolicyFromEnv, betaAccessStatus, type BetaAccessPolicy } from "../hosted/beta-access.js";
+import {
+  applyStripeEvent,
+  billingAccessStatus,
+  billingConfigFromEnv,
+  constructStripeEvent,
+  createBillingPortal,
+  createCheckout
+} from "../hosted/billing.js";
+import {
+  hostedAuthConfigFromEnv,
+  localActor,
+  verifyFirebaseRequest,
+  type HostedActor
+} from "../hosted/firebase-auth.js";
+import { isolateHostedActor, openHostedVault, type HostedVaultContext } from "../hosted/tenant-vault.js";
+import {
+  authenticateHostedAccessToken,
+  issueHostedAccessToken,
+  listHostedAccessTokens,
+  revokeHostedAccessToken
+} from "../hosted/access-tokens.js";
+import { tenantIdForServiceTokenHash } from "../hosted/tenant-id.js";
+import { assertHostedCapability, capabilityForApi, capabilityForMcpTool } from "../hosted/authorization.js";
+import {
+  acceptOrganizationInvitation,
+  createOrganization,
+  createOrganizationSpace,
+  deletePendingOrganization,
+  inviteOrganizationMember,
+  listOrganizationMembers,
+  listOrganizationsForUser,
+  listOrganizationSpaces,
+  organizationPolicy,
+  resolveOrganizationActor,
+  updateOrganizationMember,
+  updateOrganizationPolicy
+} from "../hosted/organizations.js";
+import {
+  authenticateScimToken,
+  discoverEnterpriseProviders,
+  issueScimToken,
+  organizationSsoStatus,
+  updateOrganizationSso
+} from "../hosted/enterprise-auth.js";
 
 export interface HttpMcpServerOptions {
   host: string;
   port: number;
   token?: string;
+  serviceTokens?: string[];
   readOnly: boolean;
   serveUi: boolean;
+  hosted?: {
+    enabled: boolean;
+    firebaseProjectId?: string;
+    verifyRequest?: (req: IncomingMessage) => Promise<HostedActor | null>;
+  };
 }
 
 interface WatchState {
@@ -88,10 +149,11 @@ interface AuthSettingsFile {
   };
 }
 
-export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOptions): void {
-  const db = openDatabase(paths.dbPath);
-  migrateDatabase(db);
-  restorePersistedWatcher(db, paths);
+export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOptions): Server {
+  const controlDb = openDatabase(paths.dbPath);
+  const tenantVaults = new Map<string, HostedVaultContext>();
+  migrateDatabase(controlDb);
+  restorePersistedWatcher(controlDb, paths);
 
   const server = createServer(async (req, res) => {
     try {
@@ -100,6 +162,33 @@ export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOption
       if (req.method === "OPTIONS") {
         res.writeHead(204);
         res.end();
+        return;
+      }
+
+      const requestUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? `${options.host}:${options.port}`}`);
+
+      if (requestUrl.pathname === "/.well-known/mcp/server-card.json" && req.method === "GET") {
+        sendJson(res, 200, neurakeepServerCard());
+        return;
+      }
+
+      if (requestUrl.pathname === "/.well-known/oauth-protected-resource" || requestUrl.pathname === "/.well-known/oauth-protected-resource/mcp") {
+        sendJson(res, 200, oauthProtectedResourceMetadata(req, options));
+        return;
+      }
+
+      if (requestUrl.pathname === "/.well-known/oauth-authorization-server") {
+        sendJson(res, 200, oauthAuthorizationServerMetadata(req, options));
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/auth/sso/providers" && req.method === "GET") {
+        sendJson(res, 200, { providers: discoverEnterpriseProviders(requestUrl.searchParams.get("email") ?? undefined) });
+        return;
+      }
+
+      if (requestUrl.pathname.startsWith("/scim/v2/")) {
+        await handleScimRequest(controlDb, req, res, requestUrl);
         return;
       }
 
@@ -123,25 +212,72 @@ export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOption
       }
 
       if (req.url === "/mcp" && req.method === "POST") {
-        if (!authorizeRequest(req, options)) {
+        const actor = await authorizeRequest(req, controlDb, options);
+        if (!actor) {
           sendJson(res, 401, { error: "unauthorized" });
           return;
         }
-        const body = await readBody(req);
-        const payload = JSON.parse(body) as unknown;
-        const response = Array.isArray(payload)
-          ? payload.map((item) => handleHttpRequest(db, paths, item, options.readOnly)).filter(Boolean)
-          : handleHttpRequest(db, paths, payload, options.readOnly);
-        sendJson(res, 200, response);
+        const billing = billingAccessStatus(controlDb, actor);
+        if (options.hosted?.enabled && !billing.entitled) {
+          sendJson(res, 402, { error: "subscription_required", billing });
+          return;
+        }
+        const vault = requestVault(controlDb, paths, actor, options, tenantVaults);
+        try {
+          const body = await readBody(req);
+          const payload = JSON.parse(body) as unknown;
+          const response = Array.isArray(payload)
+            ? payload.map((item) => handleHttpRequest(vault.db, vault.paths, item, options.readOnly, actor)).filter(Boolean)
+            : handleHttpRequest(vault.db, vault.paths, payload, options.readOnly, actor);
+          recordHostedAudit(vault.db, {
+            actor,
+            action: "mcp.request",
+            targetType: "mcp",
+            status: "ok",
+            metadata: { batch: Array.isArray(payload), readOnly: options.readOnly }
+          });
+          sendJson(res, 200, response);
+        } finally {
+          vault.close();
+        }
         return;
       }
 
       if (req.url?.startsWith("/api/")) {
-        if (!authorizeRequest(req, options)) {
+        if (requestUrl.pathname === "/api/billing/webhook" && req.method === "POST") {
+          await handleStripeWebhook(controlDb, req, res);
+          return;
+        }
+        const actor = await authorizeRequest(req, controlDb, options);
+        if (!actor) {
           sendJson(res, 401, { error: "unauthorized" });
           return;
         }
-        await handleApiRequest(db, paths, req, res, options);
+        if (requestUrl.pathname.startsWith("/api/billing/")) {
+          await handleBillingRequest(controlDb, req, res, actor);
+          return;
+        }
+        if (requestUrl.pathname.startsWith("/api/hosted/organizations") ||
+            requestUrl.pathname.startsWith("/api/hosted/invitations") ||
+            requestUrl.pathname.startsWith("/api/hosted/team")) {
+          await handleOrganizationRequest(controlDb, req, res, actor, requestUrl, options.readOnly);
+          return;
+        }
+        const billing = billingAccessStatus(controlDb, actor);
+        if (options.hosted?.enabled && !billing.entitled) {
+          sendJson(res, 402, { error: "subscription_required", billing });
+          return;
+        }
+        if (requestUrl.pathname.startsWith("/api/hosted/tokens")) {
+          await handleHostedTokenRequest(controlDb, req, res, actor, options.readOnly);
+          return;
+        }
+        const vault = requestVault(controlDb, paths, actor, options, tenantVaults);
+        try {
+          await handleApiRequest(vault.db, vault.paths, req, res, options, actor, controlDb);
+        } finally {
+          vault.close();
+        }
         return;
       }
 
@@ -154,7 +290,7 @@ export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOption
 
       sendJson(res, 404, { error: "not_found" });
     } catch (error) {
-      sendJson(res, 500, {
+      sendJson(res, error instanceof HttpStatusError ? error.status : Number((error as { statusCode?: number })?.statusCode ?? 500), {
         error: error instanceof Error ? error.message : String(error)
       });
     }
@@ -167,12 +303,276 @@ export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOption
   });
 
   const close = (): void => {
-    stopAutoIngestWatcher(paths);
     server.close();
-    db.close();
   };
+  server.on("close", () => {
+    stopAutoIngestWatcher(paths);
+    for (const vault of tenantVaults.values()) {
+      stopAutoIngestWatcher(vault.paths);
+      if (vault.db.open) vault.db.close();
+    }
+    if (controlDb.open) controlDb.close();
+    process.off("SIGINT", close);
+    process.off("SIGTERM", close);
+  });
   process.once("SIGINT", close);
   process.once("SIGTERM", close);
+  return server;
+}
+
+class HttpStatusError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+async function handleBillingRequest(
+  db: UmosDatabase,
+  req: IncomingMessage,
+  res: ServerResponse,
+  actor: HostedActor
+): Promise<void> {
+  const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  if (url.pathname === "/api/billing/status" && req.method === "GET") {
+    sendJson(res, 200, billingAccessStatus(db, actor));
+    return;
+  }
+  if (url.pathname === "/api/billing/checkout" && req.method === "POST") {
+    const body = JSON.parse((await readBody(req)) || "{}") as { plan?: string; offer?: string; organizationName?: string; seats?: number };
+    let checkoutActor = body.plan === "team"
+      ? actor
+      : isolateHostedActor({ ...actor, organizationId: undefined, organizationName: undefined, membershipRole: undefined });
+    let createdOrganizationId: string | undefined;
+    if (body.plan === "team" && !actor.organizationId) {
+      const organization = createOrganization(db, actor, String(body.organizationName ?? ""), Number(body.seats ?? 2));
+      const space = listOrganizationSpaces(db, organization.id)[0];
+      checkoutActor = resolveOrganizationActor(db, actor, organization.id, space.id);
+      createdOrganizationId = organization.id;
+    }
+    let result;
+    try {
+      result = await createCheckout(db, checkoutActor, String(body.plan ?? ""), body.offer);
+    } catch (error) {
+      if (createdOrganizationId) deletePendingOrganization(db, actor, createdOrganizationId);
+      throw error;
+    }
+    sendJson(res, 200, result);
+    return;
+  }
+  if (url.pathname === "/api/billing/portal" && req.method === "POST") {
+    sendJson(res, 200, await createBillingPortal(db, actor));
+    return;
+  }
+  sendJson(res, 404, { error: "not_found" });
+}
+
+async function handleOrganizationRequest(
+  db: UmosDatabase,
+  req: IncomingMessage,
+  res: ServerResponse,
+  actor: HostedActor,
+  url: URL,
+  readOnly: boolean
+): Promise<void> {
+  if (url.pathname === "/api/hosted/organizations" && req.method === "GET") {
+    sendJson(res, 200, { organizations: listOrganizationsForUser(db, actor) });
+    return;
+  }
+  if (url.pathname === "/api/hosted/organizations" && req.method === "POST") {
+    assertWritable(readOnly, "organization creation");
+    const body = JSON.parse((await readBody(req)) || "{}") as { name?: string; seats?: number };
+    const organization = createOrganization(db, actor, String(body.name ?? ""), Number(body.seats ?? 2));
+    sendJson(res, 201, { organization, spaces: listOrganizationSpaces(db, organization.id) });
+    return;
+  }
+  if (url.pathname === "/api/hosted/invitations/accept" && req.method === "POST") {
+    assertWritable(readOnly, "invitation acceptance");
+    const body = JSON.parse((await readBody(req)) || "{}") as { token?: string };
+    sendJson(res, 200, acceptOrganizationInvitation(db, actor, String(body.token ?? "")));
+    return;
+  }
+  if (!actor.organizationId) throw new HttpStatusError(400, "Select a team workspace first.");
+  if (url.pathname === "/api/hosted/team/spaces" && req.method === "GET") {
+    sendJson(res, 200, { spaces: listOrganizationSpaces(db, actor.organizationId) });
+    return;
+  }
+  if (url.pathname === "/api/hosted/team/spaces" && req.method === "POST") {
+    assertWritable(readOnly, "space creation");
+    const body = JSON.parse((await readBody(req)) || "{}") as { name?: string };
+    sendJson(res, 201, { space: createOrganizationSpace(db, actor, String(body.name ?? "")) });
+    return;
+  }
+  if (url.pathname === "/api/hosted/team/members" && req.method === "GET") {
+    sendJson(res, 200, { members: listOrganizationMembers(db, actor) });
+    return;
+  }
+  if (url.pathname === "/api/hosted/team/invitations" && req.method === "POST") {
+    assertWritable(readOnly, "member invitation");
+    const body = JSON.parse((await readBody(req)) || "{}") as { email?: string; role?: string };
+    sendJson(res, 201, inviteOrganizationMember(db, actor, String(body.email ?? ""), String(body.role ?? "viewer")));
+    return;
+  }
+  const memberMatch = /^\/api\/hosted\/team\/members\/([^/]+)$/.exec(url.pathname);
+  if (memberMatch && (req.method === "PATCH" || req.method === "DELETE")) {
+    assertWritable(readOnly, "member management");
+    const body = req.method === "PATCH" ? JSON.parse((await readBody(req)) || "{}") as { role?: string; revoke?: boolean } : { revoke: true };
+    const changed = updateOrganizationMember(db, actor, decodeURIComponent(memberMatch[1]), body.role, Boolean(body.revoke));
+    sendJson(res, changed ? 200 : 404, changed ? { ok: true } : { error: "member_not_found" });
+    return;
+  }
+  if (url.pathname === "/api/hosted/team/policy" && req.method === "GET") {
+    sendJson(res, 200, { policy: organizationPolicy(db, actor) });
+    return;
+  }
+  if (url.pathname === "/api/hosted/team/policy" && req.method === "PATCH") {
+    assertWritable(readOnly, "organization policy update");
+    sendJson(res, 200, { policy: updateOrganizationPolicy(db, actor, JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>) });
+    return;
+  }
+  if (url.pathname === "/api/hosted/team/sso" && req.method === "GET") {
+    sendJson(res, 200, { sso: organizationSsoStatus(db, actor) });
+    return;
+  }
+  if (url.pathname === "/api/hosted/team/sso" && req.method === "PATCH") {
+    assertWritable(readOnly, "SSO configuration update");
+    sendJson(res, 200, { sso: updateOrganizationSso(db, actor, JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>) });
+    return;
+  }
+  if (url.pathname === "/api/hosted/team/scim-tokens" && req.method === "POST") {
+    assertWritable(readOnly, "SCIM token creation");
+    const body = JSON.parse((await readBody(req)) || "{}") as { name?: string };
+    sendJson(res, 201, issueScimToken(db, actor, String(body.name ?? "SCIM provisioning")));
+    return;
+  }
+  sendJson(res, 404, { error: "not_found" });
+}
+
+async function handleScimRequest(db: UmosDatabase, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  const token = bearerToken(req);
+  const organizationId = token ? authenticateScimToken(db, token) : null;
+  if (!organizationId) throw new HttpStatusError(401, "Invalid SCIM bearer token.");
+  if (url.pathname === "/scim/v2/Users" && req.method === "GET") {
+    const resources = db.prepare(`SELECT user_id AS id, email AS userName, display_name AS displayName,
+      status = 'active' AS active, role FROM hosted_org_memberships WHERE organization_id = ? ORDER BY created_at ASC`)
+      .all(organizationId);
+    sendJson(res, 200, { schemas: ["urn:ietf:params:scim:api:messages:2.0:ListResponse"], totalResults: resources.length, startIndex: 1, itemsPerPage: resources.length, Resources: resources });
+    return;
+  }
+  if (url.pathname === "/scim/v2/Users" && req.method === "POST") {
+    const body = JSON.parse((await readBody(req)) || "{}") as { userName?: string; displayName?: string; externalId?: string; active?: boolean };
+    const email = String(body.userName ?? "").trim().toLowerCase();
+    if (!email.includes("@")) throw new HttpStatusError(400, "SCIM userName must be an email address.");
+    const org = db.prepare("SELECT seat_count AS seatCount FROM hosted_organizations WHERE id = ?").get(organizationId) as { seatCount: number };
+    const count = Number((db.prepare("SELECT COUNT(*) AS count FROM hosted_org_memberships WHERE organization_id = ? AND status = 'active'").get(organizationId) as { count: number }).count);
+    if (count >= org.seatCount) throw new HttpStatusError(409, "No licensed Team seat is available.");
+    const id = `scim_${sha256(String(body.externalId ?? email)).slice(0, 32)}`;
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO hosted_org_memberships (organization_id, user_id, email, display_name, role, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'viewer', ?, ?, ?)
+      ON CONFLICT(organization_id, user_id) DO UPDATE SET email=excluded.email, display_name=excluded.display_name,
+        status=excluded.status, updated_at=excluded.updated_at`)
+      .run(organizationId, id, email, String(body.displayName ?? email).slice(0, 100), body.active === false ? "revoked" : "active", now, now);
+    sendJson(res, 201, { schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"], id, userName: email, displayName: body.displayName ?? email, active: body.active !== false });
+    return;
+  }
+  const match = /^\/scim\/v2\/Users\/([^/]+)$/.exec(url.pathname);
+  if (match && req.method === "GET") {
+    const user = db.prepare(`SELECT user_id AS id, email AS userName, display_name AS displayName,
+      status = 'active' AS active, role FROM hosted_org_memberships WHERE organization_id = ? AND user_id = ?`)
+      .get(organizationId, decodeURIComponent(match[1]));
+    if (!user) throw new HttpStatusError(404, "SCIM user not found.");
+    sendJson(res, 200, { schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"], ...(user as Record<string, unknown>) });
+    return;
+  }
+  if (match && (req.method === "PATCH" || req.method === "PUT")) {
+    const body = JSON.parse((await readBody(req)) || "{}") as { userName?: string; displayName?: string; active?: boolean; Operations?: Array<{ op?: string; path?: string; value?: unknown }> };
+    let active = body.active;
+    for (const operation of body.Operations ?? []) {
+      if (String(operation.path ?? "").toLowerCase() === "active") active = Boolean(operation.value);
+    }
+    const current = db.prepare("SELECT email, display_name AS displayName, status FROM hosted_org_memberships WHERE organization_id = ? AND user_id = ?")
+      .get(organizationId, decodeURIComponent(match[1])) as { email?: string; displayName?: string; status: string } | undefined;
+    if (!current) throw new HttpStatusError(404, "SCIM user not found.");
+    const email = String(body.userName ?? current.email ?? "").trim().toLowerCase();
+    if (!email.includes("@")) throw new HttpStatusError(400, "SCIM userName must be an email address.");
+    const status = active === undefined ? current.status : active ? "active" : "revoked";
+    if (status === "active" && current.status !== "active") {
+      const org = db.prepare("SELECT seat_count AS seatCount FROM hosted_organizations WHERE id = ?").get(organizationId) as { seatCount: number };
+      const count = Number((db.prepare("SELECT COUNT(*) AS count FROM hosted_org_memberships WHERE organization_id = ? AND status = 'active'").get(organizationId) as { count: number }).count);
+      if (count >= org.seatCount) throw new HttpStatusError(409, "No licensed Team seat is available.");
+    }
+    db.prepare("UPDATE hosted_org_memberships SET email = ?, display_name = ?, status = ?, updated_at = ? WHERE organization_id = ? AND user_id = ?")
+      .run(email, String(body.displayName ?? current.displayName ?? email).slice(0, 100), status, new Date().toISOString(), organizationId, decodeURIComponent(match[1]));
+    sendJson(res, 200, { schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"], id: decodeURIComponent(match[1]), userName: email, displayName: body.displayName ?? current.displayName ?? email, active: status === "active" });
+    return;
+  }
+  if (match && req.method === "DELETE") {
+    const changed = db.prepare("UPDATE hosted_org_memberships SET status = 'revoked', updated_at = ? WHERE organization_id = ? AND user_id = ?")
+      .run(new Date().toISOString(), organizationId, decodeURIComponent(match[1])).changes;
+    if (!changed) throw new HttpStatusError(404, "SCIM user not found.");
+    res.writeHead(204); res.end(); return;
+  }
+  throw new HttpStatusError(404, "SCIM resource not found.");
+}
+
+async function handleStripeWebhook(db: UmosDatabase, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const signature = String(req.headers["stripe-signature"] ?? "");
+  if (!signature) {
+    sendJson(res, 400, { error: "missing_stripe_signature" });
+    return;
+  }
+  const rawBody = await readBody(req);
+  const event = constructStripeEvent(rawBody, signature, billingConfigFromEnv());
+  sendJson(res, 200, { received: true, ...applyStripeEvent(db, event) });
+}
+
+async function handleHostedTokenRequest(
+  db: UmosDatabase,
+  req: IncomingMessage,
+  res: ServerResponse,
+  actor: HostedActor,
+  readOnly: boolean
+): Promise<void> {
+  const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  if (url.pathname === "/api/hosted/tokens" && req.method === "GET") {
+    sendJson(res, 200, { tokens: listHostedAccessTokens(db, actor) });
+    return;
+  }
+  if (url.pathname === "/api/hosted/tokens" && req.method === "POST") {
+    assertWritable(readOnly, "access token creation");
+    const body = JSON.parse((await readBody(req)) || "{}") as { name?: string };
+    sendJson(res, 201, issueHostedAccessToken(db, actor, String(body.name ?? "MCP access")));
+    return;
+  }
+  if (url.pathname === "/api/hosted/tokens/revoke" && req.method === "POST") {
+    assertWritable(readOnly, "access token revocation");
+    const body = JSON.parse((await readBody(req)) || "{}") as { id?: string };
+    const revoked = revokeHostedAccessToken(db, actor, String(body.id ?? ""));
+    sendJson(res, revoked ? 200 : 404, revoked ? { ok: true } : { error: "token_not_found" });
+    return;
+  }
+  sendJson(res, 404, { error: "not_found" });
+}
+
+function requestVault(
+  controlDb: UmosDatabase,
+  basePaths: VaultPaths,
+  actor: HostedActor,
+  options: HttpMcpServerOptions,
+  tenantVaults: Map<string, HostedVaultContext>
+): HostedVaultContext {
+  if (options.hosted?.enabled && actor.provider !== "local") {
+    const vaultKey = `${actor.tenantId}:${actor.spaceId}`;
+    let vault = tenantVaults.get(vaultKey);
+    if (!vault) {
+      vault = openHostedVault(basePaths, actor);
+      tenantVaults.set(vaultKey, vault);
+    }
+    ensureHostedDefaults(vault.db, actor);
+    return { db: vault.db, paths: vault.paths, close: () => undefined };
+  }
+  ensureHostedDefaults(controlDb, actor);
+  return { db: controlDb, paths: basePaths, close: () => undefined };
 }
 
 async function handleApiRequest(
@@ -180,13 +580,16 @@ async function handleApiRequest(
   paths: VaultPaths,
   req: IncomingMessage,
   res: ServerResponse,
-  options: HttpMcpServerOptions
+  options: HttpMcpServerOptions,
+  actor: HostedActor = localActor(),
+  controlDb: UmosDatabase = db
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const readOnly = options.readOnly;
+  if (options.hosted?.enabled) assertHostedCapability(actor, capabilityForApi(url.pathname, req.method ?? "GET"));
 
   if (url.pathname === "/api/auth/settings" && req.method === "GET") {
-    sendJson(res, 200, authSettings(paths, options));
+    sendJson(res, 200, authSettings(paths, options, actor, db));
     return;
   }
 
@@ -194,6 +597,58 @@ async function handleApiRequest(
     assertWritable(readOnly, "auth settings");
     const body = JSON.parse((await readBody(req)) || "{}") as Partial<AuthSettingsFile>;
     const result = writeAuthSettings(paths, body, options);
+    recordHostedAudit(db, { actor, action: "auth.settings.update", targetType: "settings", status: "ok" });
+    sendJson(res, 200, result);
+    return;
+  }
+
+  if (url.pathname === "/api/hosted/status" && req.method === "GET") {
+    sendJson(res, 200, hostedStatus(options, actor));
+    return;
+  }
+
+  if (url.pathname === "/api/hosted/spaces" && req.method === "GET") {
+    sendJson(res, 200, { actor, spaces: listHostedSpaces(db, actor.tenantId) });
+    return;
+  }
+
+  if (url.pathname === "/api/hosted/audit" && req.method === "GET") {
+    sendJson(res, 200, { events: listHostedAudit(db, actor.tenantId, Number(url.searchParams.get("limit") ?? 50)) });
+    return;
+  }
+
+  if (url.pathname === "/api/hosted/access" && req.method === "GET") {
+    sendJson(res, 200, { actor, access: { allowed: true, reason: "authenticated_account", accessModel: "stripe_subscription" } });
+    return;
+  }
+
+  if (url.pathname === "/api/hosted/storage" && req.method === "GET") {
+    sendJson(res, 200, hostedStorageStatus(paths, options, actor));
+    return;
+  }
+
+  if (url.pathname === "/api/hosted/ops" && req.method === "GET") {
+    sendJson(res, 200, hostedOpsStatus(db, paths, options, actor));
+    return;
+  }
+
+  if (url.pathname === "/api/onboarding/launch-flow" && req.method === "GET") {
+    sendJson(res, 200, betaLaunchFlow(db, paths, options, actor));
+    return;
+  }
+
+  if (url.pathname === "/api/onboarding/sample-memory" && req.method === "POST") {
+    assertWritable(readOnly, "sample memory import");
+    const result = importFirstRunSampleMemory(db, paths, actor);
+    recordHostedAudit(db, {
+      actor,
+      action: "onboarding.sample_memory.import",
+      targetType: "source",
+      targetId: String((result.ingest as { sourceId?: string } | undefined)?.sourceId ?? ""),
+      status: "ok",
+      metadata: { proposalId: (result.proposal as { proposalId?: string } | null)?.proposalId ?? null }
+    });
+    exportStaticApp(db, paths);
     sendJson(res, 200, result);
     return;
   }
@@ -210,22 +665,35 @@ async function handleApiRequest(
   }
 
   if (url.pathname === "/api/search" && req.method === "GET") {
-    sendJson(res, 200, searchMemory(db, url.searchParams));
+    const result = searchMemory(db, url.searchParams);
+    recordHostedAudit(db, {
+      actor,
+      action: "memory.search",
+      targetType: "search",
+      status: "ok",
+      metadata: {
+        queryHash: shortHash(url.searchParams.get("query") ?? ""),
+        resultCount: Array.isArray(result.results) ? result.results.length : 0,
+        memoryType: url.searchParams.get("memoryType") ?? "all"
+      }
+    });
+    sendJson(res, 200, result);
     return;
   }
 
   if (url.pathname === "/api/integrations/status" && req.method === "GET") {
-    sendJson(res, 200, integrationStatus(db, paths, options));
+    sendJson(res, 200, integrationStatus(db, paths, options, actor));
     return;
   }
 
   if (url.pathname === "/api/workflow/daily-loop" && req.method === "GET") {
-    sendJson(res, 200, dailyWorkflowStatus(db, paths, options));
+    sendJson(res, 200, dailyWorkflowStatus(db, paths, options, actor));
     return;
   }
 
   if (url.pathname === "/api/workflow/daily-loop" && req.method === "POST") {
     assertWritable(readOnly, "daily workflow loop");
+    assertLocalFilesystemAccess(options, actor, "workspace memory sync");
     const body = JSON.parse((await readBody(req)) || "{}") as { queueSummary?: boolean; reason?: string };
     const result = body.queueSummary === false ? null : queueSelfMemorySummary(db, paths, "session-close");
     const sync = syncWorkspaceMemoryFiles(db, paths);
@@ -234,7 +702,7 @@ async function handleApiRequest(
       ok: true,
       queued: result,
       sync,
-      status: dailyWorkflowStatus(db, paths, options),
+      status: dailyWorkflowStatus(db, paths, options, actor),
       queueOnly: true
     });
     return;
@@ -296,6 +764,7 @@ async function handleApiRequest(
 
   if (url.pathname === "/api/import" && req.method === "POST") {
     assertWritable(readOnly, "manual import");
+    assertLocalFilesystemAccess(options, actor, "server-side path import");
     const body = JSON.parse((await readBody(req)) || "{}") as { path?: string; kind?: string };
     const sourcePath = requireManualImportPath(paths, String(body.path ?? ""));
     const kind = body.kind && body.kind !== "auto" ? normalizeIngestKind(body.kind) : kindFromExtension(sourcePath);
@@ -309,6 +778,18 @@ async function handleApiRequest(
       sensitivity: "internal"
     });
     const proposal = ingest.skipped ? null : proposeSourceExtraction(db, ingest.sourceId, { reportPaths: paths });
+    recordHostedAudit(db, {
+      actor,
+      action: "memory.import",
+      targetType: "source",
+      targetId: ingest.sourceId,
+      status: "ok",
+      metadata: {
+        kind,
+        skipped: Boolean(ingest.skipped),
+        proposalId: (proposal as { proposalId?: string } | null)?.proposalId ?? null
+      }
+    });
     exportStaticApp(db, paths);
     sendJson(res, 200, { ingest, proposal, queueOnly: true });
     return;
@@ -322,10 +803,12 @@ async function handleApiRequest(
       contentBase64?: string;
     };
     const fileName = safeUploadName(String(body.fileName ?? "memory-upload.txt"));
+    const uploadContent = Buffer.from(String(body.contentBase64 ?? ""), "base64");
+    enforceOrganizationUploadPolicy(controlDb, actor, "internal", uploadContent.toString("utf8"));
     const uploadDir = join(paths.inboxDir, "manual-uploads");
     mkdirSync(uploadDir, { recursive: true });
     const uploadPath = join(uploadDir, `${Date.now()}-${fileName}`);
-    writeFileSync(uploadPath, Buffer.from(String(body.contentBase64 ?? ""), "base64"));
+    writeFileSync(uploadPath, uploadContent);
     const kind = body.kind && body.kind !== "auto" ? normalizeIngestKind(body.kind) : kindFromExtension(uploadPath);
     const ingest = ingestFile(db, paths, {
       path: uploadPath,
@@ -337,6 +820,19 @@ async function handleApiRequest(
       sensitivity: "internal"
     });
     const proposal = ingest.skipped ? null : proposeSourceExtraction(db, ingest.sourceId, { reportPaths: paths });
+    recordHostedAudit(db, {
+      actor,
+      action: "memory.import.upload",
+      targetType: "source",
+      targetId: ingest.sourceId,
+      status: "ok",
+      metadata: {
+        kind,
+        skipped: Boolean(ingest.skipped),
+        proposalId: (proposal as { proposalId?: string } | null)?.proposalId ?? null,
+        fileName
+      }
+    });
     exportStaticApp(db, paths);
     sendJson(res, 200, { uploadPath, ingest, proposal, queueOnly: true });
     return;
@@ -348,12 +844,13 @@ async function handleApiRequest(
   }
 
   if (url.pathname === "/api/import/supported" && req.method === "GET") {
-    sendJson(res, 200, importSupport(paths));
+    sendJson(res, 200, importSupport(paths, options, actor));
     return;
   }
 
   if (url.pathname === "/api/auto-ingest" && req.method === "POST") {
     assertWritable(readOnly, "auto-ingest");
+    assertLocalFilesystemAccess(options, actor, "server-side auto-ingest");
     const body = JSON.parse((await readBody(req)) || "{}") as { profileId?: string };
     const profile = resolveWatcherProfile(paths, body.profileId);
     const result = autoIngestQueue(db, paths, {
@@ -377,17 +874,20 @@ async function handleApiRequest(
   }
 
   if (url.pathname === "/api/watch/profiles" && req.method === "GET") {
+    assertLocalFilesystemAccess(options, actor, "server-side watcher profiles");
     sendJson(res, 200, { profiles: watcherProfiles(paths) });
     return;
   }
 
   if (url.pathname === "/api/watch/status" && req.method === "GET") {
+    assertLocalFilesystemAccess(options, actor, "server-side watcher status");
     sendJson(res, 200, watchStatus(paths));
     return;
   }
 
   if (url.pathname === "/api/watch/start" && req.method === "POST") {
     assertWritable(readOnly, "watch start");
+    assertLocalFilesystemAccess(options, actor, "server-side watcher start");
     const body = JSON.parse((await readBody(req)) || "{}") as {
       folders?: string[];
       debounceMs?: number;
@@ -400,6 +900,7 @@ async function handleApiRequest(
 
   if (url.pathname === "/api/watch/stop" && req.method === "POST") {
     assertWritable(readOnly, "watch stop");
+    assertLocalFilesystemAccess(options, actor, "server-side watcher stop");
     sendJson(res, 200, stopAutoIngestWatcher(paths));
     return;
   }
@@ -411,6 +912,7 @@ async function handleApiRequest(
 
   if (url.pathname === "/api/write-summary" && req.method === "POST") {
     assertWritable(readOnly, "write summary");
+    assertLocalFilesystemAccess(options, actor, "workspace summary");
     const result = writeWorkspaceSummary(db, paths);
     exportStaticApp(db, paths);
     sendJson(res, 200, result);
@@ -419,6 +921,7 @@ async function handleApiRequest(
 
   if (url.pathname === "/api/self-memory/queue" && req.method === "POST") {
     assertWritable(readOnly, "self memory queue");
+    assertLocalFilesystemAccess(options, actor, "workspace self-memory queue");
     const body = JSON.parse((await readBody(req)) || "{}") as { reason?: string };
     const reason = body.reason === "heartbeat" || body.reason === "session-close" ? body.reason : "manual";
     const result = queueSelfMemorySummary(db, paths, reason);
@@ -430,6 +933,7 @@ async function handleApiRequest(
 
   if (url.pathname === "/api/self-memory/session-close" && req.method === "POST") {
     assertWritable(readOnly, "session close memory queue");
+    assertLocalFilesystemAccess(options, actor, "workspace session-close sync");
     const result = queueSelfMemorySummary(db, paths, "session-close");
     const sync = syncWorkspaceMemoryFiles(db, paths);
     exportStaticApp(db, paths);
@@ -439,6 +943,7 @@ async function handleApiRequest(
 
   if (url.pathname === "/api/memory/sync" && req.method === "POST") {
     assertWritable(readOnly, "workspace memory sync");
+    assertLocalFilesystemAccess(options, actor, "workspace memory sync");
     const result = syncWorkspaceMemoryFiles(db, paths);
     exportStaticApp(db, paths);
     sendJson(res, 200, result);
@@ -611,6 +1116,14 @@ async function handleApiRequest(
       }
     }
     const result = applyProposal(db, paths, applyProposalMatch[1]);
+    recordHostedAudit(db, {
+      actor,
+      action: "proposal.apply",
+      targetType: "proposal",
+      targetId: applyProposalMatch[1],
+      status: "ok",
+      metadata: { inserted: result.inserted }
+    });
     exportStaticApp(db, paths);
     sendJson(res, 200, result);
     return;
@@ -1032,6 +1545,7 @@ function fuzzyDuplicateFactPreview(db: UmosDatabase): Array<Record<string, unkno
       ids: sorted.map((row) => row.id)
     };
   });
+
 }
 
 function fuzzyDuplicateGroups(rows: Array<{
@@ -1159,7 +1673,8 @@ function ocrHealth(): Record<string, unknown> {
   };
 }
 
-function importSupport(paths: VaultPaths): Record<string, unknown> {
+function importSupport(paths: VaultPaths, options: HttpMcpServerOptions, actor: HostedActor): Record<string, unknown> {
+  const hostedCustomer = Boolean(options.hosted?.enabled) && actor.provider !== "local" && !actor.roles.includes("system");
   const workspaceRoot = resolve(paths.root, "..", "..", "..");
   return {
     supportedKinds: [
@@ -1168,8 +1683,9 @@ function importSupport(paths: VaultPaths): Record<string, unknown> {
       { kind: "session", extensions: [".jsonl"], proposalReviewed: true },
       { kind: "pdf", extensions: [".pdf"], proposalReviewed: true, ocrFallback: true }
     ],
-    approvedRoots: [resolve(paths.root), workspaceRoot, homedir()],
-    inbox: paths.inboxDir,
+    approvedRoots: hostedCustomer ? [] : [resolve(paths.root), workspaceRoot, homedir()],
+    inbox: hostedCustomer ? "tenant://inbox" : paths.inboxDir,
+    uploadOnly: hostedCustomer,
     policy: {
       rawSourcesAutoIndexed: true,
       durableMemoryAutoApplied: false,
@@ -1179,13 +1695,344 @@ function importSupport(paths: VaultPaths): Record<string, unknown> {
   };
 }
 
-function integrationStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcpServerOptions): Record<string, unknown> {
+function enforceOrganizationUploadPolicy(controlDb: UmosDatabase, actor: HostedActor, sensitivity: string, content: string): void {
+  if (!actor.organizationId) return;
+  const policy = organizationPolicy(controlDb, actor);
+  const levels = ["normal", "internal", "confidential", "secret"];
+  const maximum = levels.indexOf(String(policy.maxSensitivity ?? "secret"));
+  const requested = levels.indexOf(sensitivity);
+  if (maximum >= 0 && requested > maximum) {
+    throw new HttpStatusError(422, `This organization does not allow ${sensitivity} content in this space.`);
+  }
+  if (policy.dlpBlockSecrets !== false) {
+    const scan = scanContentForSafety(content);
+    if (scan.secretHints.length > 0) throw new HttpStatusError(422, `DLP blocked this upload: ${scan.secretHints.join(", ")}.`);
+  }
+}
+
+function hostedStorageStatus(paths: VaultPaths, options: HttpMcpServerOptions, actor: HostedActor): Record<string, unknown> {
+  const provider = process.env.NEURAKEEP_STORAGE_PROVIDER || (options.hosted?.enabled ? "object-storage-required" : "local-vault");
+  const hostedCustomer = Boolean(options.hosted?.enabled) && actor.provider !== "local" && !actor.roles.includes("system");
+  return {
+    ok: provider !== "object-storage-required",
+    provider,
+    bucket: hostedCustomer ? null : process.env.NEURAKEEP_STORAGE_BUCKET || null,
+    rawRoot: hostedCustomer ? "tenant://raw" : join(paths.root, "raw"),
+    inboxRoot: hostedCustomer ? "tenant://inbox" : paths.inboxDir,
+    tenantId: actor.tenantId,
+    spaceId: actor.spaceId,
+    policy: {
+      rawUploads: "immutable",
+      durableMemory: "proposal-reviewed",
+      generatedArtifacts: "not releasable",
+      envFiles: "not releasable"
+    },
+    missingForHosted: provider === "object-storage-required"
+      ? ["Set NEURAKEEP_STORAGE_PROVIDER and NEURAKEEP_STORAGE_BUCKET before enabling hosted accounts."]
+      : []
+  };
+}
+
+const betaAllowedEmailsKey = "hosted_beta_allowed_emails_json";
+
+function betaAccessPolicy(db?: UmosDatabase): BetaAccessPolicy {
+  const policy = betaAccessPolicyFromEnv();
+  const dbEmails = db ? readBetaAllowedEmails(db) : [];
+  const allowedEmails = Array.from(new Set([...policy.allowedEmails, ...dbEmails].map(normalizeEmail).filter(Boolean)));
+  return {
+    enabled: policy.enabled || dbEmails.length > 0,
+    allowedEmails,
+    allowedDomains: policy.allowedDomains
+  };
+}
+
+function betaTesterAdminStatus(db: UmosDatabase, actor: HostedActor): Record<string, unknown> {
+  const policy = betaAccessPolicy(db);
+  const editableEmails = readBetaAllowedEmails(db);
+  const members = listHostedMembers(db, actor.tenantId);
+  const deniedSignIns = listRecentDeniedBetaAccess(db, 25).map((row) => ({
+    ...row,
+    actorEmailMasked: maskEmail(String(row.actorEmail ?? "")),
+    reason: metadataValue(row.metadataJson, "reason")
+  }));
+  const testerActivity = betaTesterActivity(db, actor.tenantId, members, editableEmails);
+  return {
+    actor,
+    access: betaAccessStatus(actor, policy),
+    policy: {
+      enabled: policy.enabled,
+      allowlistSize: policy.allowedEmails.length + policy.allowedDomains.length,
+      editableEmails,
+      editableEmailsMasked: editableEmails.map(maskEmail),
+      envEmailsMasked: betaAccessPolicyFromEnv().allowedEmails.map(maskEmail),
+      allowedDomains: policy.allowedDomains.map((domain) => `@${domain}`)
+    },
+    metrics: betaTesterMetrics(db, actor.tenantId, policy, members, deniedSignIns),
+    members,
+    testerActivity,
+    deniedSignIns,
+    recentAuditEvents: listHostedAudit(db, actor.tenantId, 30)
+  };
+}
+
+function betaTesterMetrics(
+  db: UmosDatabase,
+  tenantId: string,
+  policy: BetaAccessPolicy,
+  members: Array<Record<string, unknown>>,
+  deniedSignIns: Array<Record<string, unknown>>
+): Record<string, unknown> {
+  const since24h = Date.now() - 24 * 60 * 60 * 1000;
+  const recent = listHostedAuditSummary(db, tenantId, 500);
+  const recent24h = recent.filter((row) => Date.parse(String(row.createdAt ?? "")) >= since24h);
+  return {
+    allowlistEmails: policy.allowedEmails.length,
+    allowlistDomains: policy.allowedDomains.length,
+    signedInMembers: members.length,
+    deniedSignIns: deniedSignIns.length,
+    deniedLast24h: deniedSignIns.filter((row) => Date.parse(String(row.createdAt ?? "")) >= since24h).length,
+    searchesLast24h: recent24h.filter((row) => row.action === "memory.search").length,
+    importsLast24h: recent24h.filter((row) => String(row.action ?? "").startsWith("memory.import") || row.action === "beta.sample_memory.import").length,
+    proposalsAppliedLast24h: recent24h.filter((row) => row.action === "proposal.apply").length
+  };
+}
+
+function betaTesterActivity(
+  db: UmosDatabase,
+  tenantId: string,
+  members: Array<Record<string, unknown>>,
+  editableEmails: string[]
+): Array<Record<string, unknown>> {
+  const byEmail = new Map<string, Record<string, unknown>>();
+  const seed = (email: string, source: string, member?: Record<string, unknown>): void => {
+    const normalized = normalizeEmail(email);
+    if (!normalized) return;
+    byEmail.set(normalized, {
+      email: normalized,
+      emailMasked: maskEmail(normalized),
+      source,
+      displayName: member?.displayName ?? "",
+      userId: member?.userId ?? "",
+      lastSeenAt: member?.updatedAt ?? null,
+      auditEvents: 0,
+      searches: 0,
+      imports: 0,
+      proposalsApplied: 0,
+      denied: 0,
+      errors: 0
+    });
+  };
+  for (const email of editableEmails) seed(email, "dashboard");
+  for (const member of members) seed(String(member.email ?? ""), "signed-in", member);
+
+  for (const row of listHostedAuditSummary(db, tenantId, 1000)) {
+    const email = normalizeEmail(row.actorEmail);
+    if (!email) continue;
+    if (!byEmail.has(email)) seed(email, "audit");
+    const entry = byEmail.get(email)!;
+    entry.auditEvents = Number(entry.auditEvents ?? 0) + 1;
+    if (row.action === "memory.search") entry.searches = Number(entry.searches ?? 0) + 1;
+    if (String(row.action ?? "").startsWith("memory.import") || row.action === "beta.sample_memory.import") {
+      entry.imports = Number(entry.imports ?? 0) + 1;
+    }
+    if (row.action === "proposal.apply") entry.proposalsApplied = Number(entry.proposalsApplied ?? 0) + 1;
+    if (row.status === "denied") entry.denied = Number(entry.denied ?? 0) + 1;
+    if (row.status === "error") entry.errors = Number(entry.errors ?? 0) + 1;
+    const createdAt = String(row.createdAt ?? "");
+    if (!entry.lastSeenAt || Date.parse(createdAt) > Date.parse(String(entry.lastSeenAt))) {
+      entry.lastSeenAt = createdAt;
+    }
+  }
+
+  return Array.from(byEmail.values()).sort((a, b) => Date.parse(String(b.lastSeenAt ?? 0)) - Date.parse(String(a.lastSeenAt ?? 0)));
+}
+
+function metadataValue(value: unknown, key: string): unknown {
+  try {
+    const parsed = JSON.parse(String(value ?? "{}")) as Record<string, unknown>;
+    return parsed[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function readBetaAllowedEmails(db: UmosDatabase): string[] {
+  const row = db.prepare("SELECT value FROM metadata WHERE key = ?").get(betaAllowedEmailsKey) as { value?: string } | undefined;
+  try {
+    const parsed = JSON.parse(row?.value ?? "[]") as unknown;
+    return Array.isArray(parsed) ? Array.from(new Set(parsed.map((item) => normalizeEmail(item)).filter(Boolean))) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeBetaAllowedEmails(db: UmosDatabase, emails: string[]): string[] {
+  const normalized = Array.from(new Set(emails.map(normalizeEmail).filter(Boolean))).sort();
+  db.prepare(
+    `
+    INSERT INTO metadata (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `
+  ).run(betaAllowedEmailsKey, JSON.stringify(normalized));
+  return normalized;
+}
+
+function normalizeEmail(value: unknown): string {
+  const email = String(value ?? "").trim().toLowerCase();
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) ? email : "";
+}
+
+function maskEmail(email: string): string {
+  const [name = "", domain = ""] = email.split("@");
+  if (!domain) return "***";
+  const prefix = name.length <= 2 ? `${name.slice(0, 1)}*` : `${name.slice(0, 2)}***`;
+  return `${prefix}@${domain}`;
+}
+
+function shortHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+function betaLaunchFlow(db: UmosDatabase, paths: VaultPaths, options: HttpMcpServerOptions, actor: HostedActor): Record<string, unknown> {
+  const quality = qualityDashboard(db, paths);
+  const counts = quality.counts as Record<string, unknown>;
+  const storage = hostedStorageStatus(paths, options, actor);
+  const integrations = integrationStatus(db, paths, options, actor);
+  const hostedEnabled = Boolean(options.hosted?.enabled);
+  const serviceTokensReady = serviceTokenConfigs(options).length > 0;
+  const steps = [
+    betaStep("signup", hostedEnabled, "Google sign-in is enabled through Firebase Auth."),
+    betaStep("tenant_space", listHostedSpaces(db, actor.tenantId).length > 0, "An isolated tenant vault and personal space exist for the account."),
+    betaStep("hosted_storage", Boolean(storage.ok), "Hosted storage provider/bucket is configured."),
+    betaStep("remote_mcp", hostedEnabled && serviceTokensReady, "Remote MCP has Firebase and at least one service-token path."),
+    betaStep("import_memory", Number(counts.sources ?? 0) > 0, "Memory sources are indexed."),
+    betaStep("review_proposals", Number(counts.warningProposals ?? 0) === 0 && Number(counts.blockedProposals ?? 0) === 0, "Proposal queue has no warning or blocked items."),
+    betaStep("search_read", Number(counts.sections ?? 0) > 0, "Search/read memory surface has indexed sections.")
+  ];
+  return {
+    ok: steps.every((step) => step.ready),
+    updatedAt: new Date().toISOString(),
+    actor,
+    steps,
+    signup: {
+      mode: hostedEnabled ? "firebase" : "local",
+      firebaseProjectId: options.hosted?.firebaseProjectId ?? null,
+      access: { allowed: true, reason: "authenticated_account" }
+    },
+    onboarding: {
+      queueOnly: true,
+      durableAutoApply: false,
+      recommendedFlow: ["Sign in", "Choose a plan", "Create isolated tenant vault", "Import sample or real memory", "Connect MCP", "Review proposals", "Search/read memory"]
+    },
+    storage,
+    remoteMcp: integrations.remoteMcp,
+    quality
+  };
+}
+
+function importFirstRunSampleMemory(db: UmosDatabase, paths: VaultPaths, actor: HostedActor): Record<string, unknown> {
+  const sampleDir = join(paths.inboxDir, "first-run");
+  mkdirSync(sampleDir, { recursive: true });
+  const samplePath = join(sampleDir, "neurakeep-first-run-sample.md");
+  writeFileSync(
+    samplePath,
+    [
+      "# NeuraKeep First-Run Sample",
+      "",
+      `Imported by: ${actor.email ?? actor.uid}`,
+      `Imported at: ${new Date().toISOString()}`,
+      "",
+      "## Decision",
+      "",
+      "Use NeuraKeep as a source-cited, proposal-reviewed memory layer for AI agents.",
+      "",
+      "## Workflow",
+      "",
+      "Raw memory sources are searchable immediately. Durable facts, decisions, and failures must be reviewed as proposals before apply.",
+      "",
+      "## Failed Path",
+      "",
+      "Do not expose the hosted graph shell before authentication and subscription checks pass."
+    ].join("\n"),
+    "utf8"
+  );
+  const ingest = ingestFile(db, paths, {
+    path: samplePath,
+    kind: "markdown",
+    space: "project",
+    trustLevel: "trusted",
+    sourceOrigin: "manual",
+    visibility: "private",
+    sensitivity: "internal"
+  });
+  const proposal = ingest.skipped ? null : proposeSourceExtraction(db, ingest.sourceId, { reportPaths: paths });
+  return { ok: true, samplePath, ingest, proposal, queueOnly: true };
+}
+
+function hostedOpsStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcpServerOptions, actor: HostedActor): Record<string, unknown> {
+  const storage = hostedStorageStatus(paths, options, actor);
+  const auditRecent = listHostedAudit(db, actor.tenantId, 10);
+  if (options.hosted?.enabled && actor.provider !== "local" && !actor.roles.includes("system")) {
+    return {
+      ok: true,
+      checkedAt: new Date().toISOString(),
+      health: { database: true, hosted: true, storageOk: Boolean(storage.ok) },
+      storage,
+      tenantIsolation: "dedicated_vault",
+      recentAuditEvents: auditRecent
+    };
+  }
+  const serviceTokens = serviceTokenConfigs(options);
+  const backupHints = [
+    "/home/admin/backups/neurakeep",
+    "/var/backups/neurakeep",
+    storage.bucket ? `gs://${storage.bucket}` : null
+  ].filter(Boolean);
+  return {
+    ok: true,
+    checkedAt: new Date().toISOString(),
+    health: {
+      http: true,
+      database: scalarCount(db, "SELECT COUNT(*) AS count FROM metadata") >= 0,
+      hosted: Boolean(options.hosted?.enabled),
+      storageOk: Boolean(storage.ok)
+    },
+    backup: {
+      configured: Boolean(storage.bucket || process.env.NEURAKEEP_BACKUP_BUCKET || process.env.NEURAKEEP_BACKUP_PATH),
+      bucket: process.env.NEURAKEEP_BACKUP_BUCKET || storage.bucket || null,
+      localPath: process.env.NEURAKEEP_BACKUP_PATH || "/home/admin/backups/neurakeep",
+      hints: backupHints,
+      verification: "Use scripts/deploy-hosted.ps1 for pre-deploy tar backups and hosted smoke checks; use scripts/hosted-healthcheck.ps1 for recurring checks."
+    },
+    alerting: {
+      pm2Process: process.env.NEURAKEEP_PM2_PROCESS || "neurakeep-hosted",
+      webhookConfigured: Boolean(process.env.NEURAKEEP_ALERT_WEBHOOK_URL),
+      reminder: "Configure a cron/PM2 monitor to call /health, /api/hosted/storage, and /mcp tools/list with a service token."
+    },
+    serviceTokens: {
+      configured: serviceTokens.length > 0,
+      count: serviceTokens.length,
+      rotationRecommendedDays: Number(process.env.NEURAKEEP_SERVICE_TOKEN_ROTATION_DAYS ?? 30),
+      rotateWith: "npm run token:issue -- --out <secure-env-file>, then deploy only NEURAKEEP_SERVICE_TOKENS=sha256:<hash>."
+    },
+    access: { allowed: true, reason: "authenticated_account", accessModel: "stripe_subscription" },
+    recentAuditEvents: auditRecent
+  };
+}
+
+function betaStep(id: string, ready: boolean, label: string): Record<string, unknown> {
+  return { id, ready, label };
+}
+
+function integrationStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcpServerOptions, actor: HostedActor = localActor()): Record<string, unknown> {
+  const hostedCustomer = Boolean(options.hosted?.enabled) && actor.provider !== "local" && !actor.roles.includes("system");
   const cliPath = resolve(dirname(fileURLToPath(import.meta.url)), "..", "cli", "index.js");
   const stdioCommand = {
     command: "node",
     args: [cliPath, "mcp", "--root", paths.root]
   };
-  const clients = [
+  const clients = hostedCustomer ? [] : [
     configStatus("OpenClaw", join(homedir(), ".openclaw", "openclaw.json")),
     configStatus("Claude Desktop", join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "Claude", "claude_desktop_config.json")),
     configStatus(
@@ -1206,21 +2053,39 @@ function integrationStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcp
     }
   ];
   const toolNames = ["memory_search", "memory_read", "memory_explain_sources", "memory_propose_update", "memory_apply_update"];
+  const serviceTokens = serviceTokenConfigs(options);
+  const localBase = `http://${options.host}:${options.port}`;
+  const publicBase = process.env.NEURAKEEP_PUBLIC_URL?.replace(/\/+$/, "") ?? localBase;
   return {
     ok: true,
     server: {
       name: "neurakeep",
-      httpEndpoint: `http://${options.host}:${options.port}/mcp`,
-      uiEndpoint: options.serveUi ? `http://${options.host}:${options.port}/index.html` : null,
+      httpEndpoint: hostedCustomer ? `${publicBase}/mcp` : `${localBase}/mcp`,
+      publicEndpoint: `${publicBase}/mcp`,
+      uiEndpoint: hostedCustomer ? `${publicBase}/app` : options.serveUi ? `${localBase}/index.html` : null,
       mode: options.readOnly ? "read-only" : "read-write",
-      tokenRequired: Boolean(options.token)
+      tokenRequired: Boolean(options.token || serviceTokens.length > 0 || options.hosted?.enabled),
+      serviceTokenConfigured: serviceTokens.length > 0,
+      hosted: Boolean(options.hosted?.enabled)
+    },
+    remoteMcp: {
+      endpoint: `${publicBase}/mcp`,
+      authModes: ["Google ID token", "service token"],
+      serviceTokenConfigured: serviceTokens.length > 0,
+      protectedResourceMetadata: `${publicBase}/.well-known/oauth-protected-resource/mcp`,
+      authorizationServerMetadata: `${publicBase}/.well-known/oauth-authorization-server`,
+      clientHints: [
+        "Use Authorization: Bearer <Google ID token> for browser/user sessions.",
+        "Use Authorization: Bearer <service token> for Claude/OpenClaw/Codex service connectors.",
+        "Prefer NEURAKEEP_SERVICE_TOKENS=sha256:<hash> in hosted deployments so raw tokens are not stored in process config."
+      ]
     },
     vault: {
-      root: paths.root,
+      root: hostedCustomer ? "tenant://vault" : paths.root,
       sourceCount: scalarCount(db, "SELECT COUNT(*) AS count FROM sources"),
       pendingProposals: scalarCount(db, "SELECT COUNT(*) AS count FROM proposals WHERE status = 'pending'")
     },
-    stdioCommand,
+    stdioCommand: hostedCustomer ? null : stdioCommand,
     tools: toolNames,
     clients,
     smokeTests: [
@@ -1237,15 +2102,15 @@ function integrationStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcp
   };
 }
 
-function dailyWorkflowStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcpServerOptions): Record<string, unknown> {
+function dailyWorkflowStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcpServerOptions, actor: HostedActor = localActor()): Record<string, unknown> {
   const dashboard = qualityDashboard(db, paths);
   const pending = dashboard.counts as Record<string, unknown>;
   return {
     ok: true,
     lastCheckedAt: new Date().toISOString(),
-    integration: integrationStatus(db, paths, options),
-    importSupport: importSupport(paths),
-    watcher: watchStatus(paths),
+    integration: integrationStatus(db, paths, options, actor),
+    importSupport: importSupport(paths, options, actor),
+    watcher: options.hosted?.enabled && actor.provider !== "local" ? { available: false, reason: "local_only" } : watchStatus(paths),
     policy: selfMemoryPolicy,
     quality: dashboard,
     recommendedActions: workflowRecommendations(pending, dashboard)
@@ -1446,7 +2311,8 @@ function handleHttpRequest(
   db: UmosDatabase,
   paths: VaultPaths,
   payload: unknown,
-  readOnly: boolean
+  readOnly: boolean,
+  actor: HostedActor = localActor()
 ): unknown {
   if (!isJsonRpcObject(payload)) {
     return {
@@ -1467,6 +2333,11 @@ function handleHttpRequest(
     }
   }
 
+  if (payload.method === "tools/call") {
+    const name = String((payload.params as Record<string, unknown> | undefined)?.name ?? "");
+    assertHostedCapability(actor, capabilityForMcpTool(name));
+  }
+
   return handleJsonRpcRequest(db, paths, payload);
 }
 
@@ -1478,33 +2349,185 @@ function isJsonRpcObject(value: unknown): value is {
   return typeof value === "object" && value !== null && typeof (value as { method?: unknown }).method === "string";
 }
 
-function authorizeRequest(req: IncomingMessage, options: HttpMcpServerOptions): boolean {
-  if (!options.token) {
-    return true;
-  }
-  const expected = `Bearer ${options.token}`;
-  return req.headers.authorization === expected;
+function oauthProtectedResourceMetadata(req: IncomingMessage, options: HttpMcpServerOptions): Record<string, unknown> {
+  const baseUrl = publicBaseUrl(req, options);
+  return {
+    resource: `${baseUrl}/mcp`,
+    authorization_servers: [`${baseUrl}/.well-known/oauth-authorization-server`],
+    bearer_methods_supported: ["header"],
+    resource_documentation: `${baseUrl}/docs/mcp`,
+    scopes_supported: ["memory:read", "memory:propose", "memory:write"],
+    neurakeep: {
+      endpoint: `${baseUrl}/mcp`,
+      hosted: Boolean(options.hosted?.enabled),
+      authModes: ["firebase_id_token", "service_token"],
+      serviceTokenConfigured: serviceTokenConfigs(options).length > 0,
+      readOnly: options.readOnly
+    }
+  };
 }
 
-function authSettings(paths: VaultPaths, options: HttpMcpServerOptions): Record<string, unknown> {
-  const saved = readAuthSettings(paths);
+function oauthAuthorizationServerMetadata(req: IncomingMessage, options: HttpMcpServerOptions): Record<string, unknown> {
+  const baseUrl = publicBaseUrl(req, options);
   return {
-    mode: saved.mode,
-    provider: "local",
-    tokenRequired: Boolean(options.token),
+    issuer: baseUrl,
+    token_endpoint_auth_methods_supported: ["client_secret_basic", "private_key_jwt", "none"],
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "client_credentials"],
+    scopes_supported: ["memory:read", "memory:propose", "memory:write"],
+    service_documentation: `${baseUrl}/docs/mcp`,
+    neurakeep: {
+      note: "Hosted NeuraKeep accepts Google ID tokens verified through Firebase Auth and pre-issued service tokens. Full OAuth authorization-code issuance is supplied by the deployment identity provider.",
+      protectedResourceMetadata: `${baseUrl}/.well-known/oauth-protected-resource/mcp`
+    }
+  };
+}
+
+async function authorizeRequest(req: IncomingMessage, db: UmosDatabase, options: HttpMcpServerOptions): Promise<HostedActor | null> {
+  const serviceActor = serviceTokenActor(req, db, options);
+  if (serviceActor) {
+    ensureHostedDefaults(db, serviceActor);
+    return serviceActor;
+  }
+
+  if (options.hosted?.enabled) {
+    let actor: HostedActor | null = null;
+    try {
+      actor = options.hosted.verifyRequest
+        ? await options.hosted.verifyRequest(req)
+        : await verifyFirebaseRequest(req, {
+            ...hostedAuthConfigFromEnv(),
+            enabled: true,
+            projectId: options.hosted.firebaseProjectId ?? hostedAuthConfigFromEnv().projectId
+          });
+    } catch {
+      return null;
+    }
+    if (!actor) return null;
+    actor = isolateHostedActor(actor);
+    const requestPath = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    if (requestPath !== "/api/hosted/organizations" && requestPath !== "/api/hosted/invitations/accept") {
+      actor = resolveOrganizationActor(
+        db,
+        actor,
+        headerValue(req.headers["x-neurakeep-tenant"]),
+        headerValue(req.headers["x-neurakeep-space"])
+      );
+    }
+    recordHostedAudit(db, {
+      actor,
+      action: "auth.sign_in",
+      targetType: "hosted_access",
+      status: "ok",
+      metadata: { tenantIsolated: true, organizationId: actor.organizationId ?? null, spaceId: actor.spaceId }
+    });
+    return actor;
+  }
+
+  if (!options.token) {
+    return localActor();
+  }
+  const expected = `Bearer ${options.token}`;
+  return req.headers.authorization === expected ? localActor() : null;
+}
+
+function authSettings(paths: VaultPaths, options: HttpMcpServerOptions, actor: HostedActor = localActor(), db?: UmosDatabase): Record<string, unknown> {
+  const saved = readAuthSettings(paths);
+  const serviceTokens = serviceTokenConfigs(options);
+  return {
+    mode: options.hosted?.enabled ? "remote" : saved.mode,
+    provider: actor.provider,
+    tokenRequired: Boolean(options.token || serviceTokens.length > 0 || options.hosted?.enabled),
+    firebaseRequired: Boolean(options.hosted?.enabled),
     readOnly: options.readOnly,
     hasToken: Boolean(options.token),
+    serviceTokenConfigured: serviceTokens.length > 0,
     endpoint: "/mcp",
+    hosted: hostedStatus(options, actor, db),
     user: {
       ...saved.user,
-      actor: {
-        provider: "local",
-        uid: "local",
-        roles: [saved.user.role]
-      },
+      actor,
       allowWrites: saved.user.allowWrites && !options.readOnly
     }
   };
+}
+
+function hostedStatus(options: HttpMcpServerOptions, actor: HostedActor, db?: UmosDatabase): Record<string, unknown> {
+  const serviceTokens = serviceTokenConfigs(options);
+  return {
+    enabled: Boolean(options.hosted?.enabled),
+    authProvider: options.hosted?.enabled ? "firebase" : serviceTokens.length > 0 ? "service_token" : "local",
+    firebaseProjectId: options.hosted?.firebaseProjectId ?? null,
+    serviceTokenConfigured: serviceTokens.length > 0,
+    serviceTokenCount: serviceTokens.length,
+    accessModel: options.hosted?.enabled ? "stripe_subscription" : "local",
+    tenantIsolation: options.hosted?.enabled && actor.provider === "firebase" ? (actor.organizationId ? "organization_space_vault" : "per_user_vault") : "single_vault",
+    tenantId: actor.tenantId,
+    spaceId: actor.spaceId,
+    roles: actor.roles,
+    uid: actor.uid,
+    email: actor.email ?? null,
+    organizationId: actor.organizationId ?? null,
+    organizationName: actor.organizationName ?? null,
+    membershipRole: actor.membershipRole ?? null
+  };
+}
+
+function headerValue(value: string | string[] | undefined): string | undefined {
+  const next = Array.isArray(value) ? value[0] : value;
+  return next?.trim() || undefined;
+}
+
+function serviceTokenActor(req: IncomingMessage, db: UmosDatabase, options: HttpMcpServerOptions): HostedActor | null {
+  const token = bearerToken(req);
+  if (!token) return null;
+  const managed = authenticateHostedAccessToken(db, token);
+  if (managed) return managed;
+  const configs = serviceTokenConfigs(options);
+  if (configs.length === 0) return null;
+  const tokenHash = sha256(token);
+  const matched = configs.some((config) => config === token || config === `sha256:${tokenHash}`);
+  if (!matched) return null;
+  const tenantId = tenantIdForServiceTokenHash(tokenHash);
+  const spaceId = process.env.NEURAKEEP_SERVICE_SPACE || "personal";
+  return {
+    provider: "service_token",
+    uid: `service:${tokenHash.slice(0, 16)}`,
+    name: "NeuraKeep service token",
+    tenantId,
+    spaceId,
+    roles: Array.from(new Set([...serviceRoles(), "system"]))
+  };
+}
+
+function serviceTokenConfigs(options: HttpMcpServerOptions): string[] {
+  return Array.from(new Set([...(options.serviceTokens ?? [])].map((token) => token.trim()).filter(Boolean)));
+}
+
+function serviceRoles(): string[] {
+  const roles = (process.env.NEURAKEEP_SERVICE_ROLES ?? "operator,mcp")
+    .split(",")
+    .map((role) => role.trim())
+    .filter(Boolean);
+  return roles.length > 0 ? roles : ["operator", "mcp"];
+}
+
+function bearerToken(req: IncomingMessage): string | null {
+  const header = String(req.headers.authorization ?? "");
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  return match ? match[1].trim() : null;
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function publicBaseUrl(req: IncomingMessage, options: HttpMcpServerOptions): string {
+  const configured = process.env.NEURAKEEP_PUBLIC_URL?.replace(/\/+$/, "");
+  if (configured) return configured;
+  const proto = String(req.headers["x-forwarded-proto"] ?? "").split(",")[0].trim() || "http";
+  const host = String(req.headers["x-forwarded-host"] ?? req.headers.host ?? `${options.host}:${options.port}`).split(",")[0].trim();
+  return `${proto}://${host}`;
 }
 
 function readAuthSettings(paths: VaultPaths): AuthSettingsFile {
@@ -1576,7 +2599,7 @@ function readBody(req: IncomingMessage, maxBytes = 2_000_000): Promise<string> {
 
 function tryServeUi(paths: VaultPaths, req: IncomingMessage, res: ServerResponse): boolean {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
-  const pathname = url.pathname === "/" ? "/index.html" : url.pathname;
+  const pathname = uiPathname(url.pathname);
   const relative = normalize(pathname.replace(/^\/+/, ""));
   if (relative.startsWith("..")) {
     return false;
@@ -1589,12 +2612,27 @@ function tryServeUi(paths: VaultPaths, req: IncomingMessage, res: ServerResponse
       return false;
     }
     const content = readFileSync(filePath);
-    res.writeHead(200, { "content-type": contentType(filePath) });
+    const headers: Record<string, string> = { "content-type": contentType(filePath) };
+    if (url.pathname === "/app" || url.pathname.startsWith("/app/") || extname(filePath).toLowerCase() === ".html") {
+      headers["x-robots-tag"] = "noindex, nofollow, noarchive";
+      headers["cache-control"] = "no-store";
+    }
+    res.writeHead(200, headers);
     res.end(content);
     return true;
   } catch {
     return false;
   }
+}
+
+function uiPathname(pathname: string): string {
+  if (pathname === "/" || pathname === "/app" || pathname === "/app/") {
+    return "/index.html";
+  }
+  if (pathname.startsWith("/app/")) {
+    return pathname.slice("/app".length);
+  }
+  return pathname;
 }
 
 function listInboxFiles(paths: VaultPaths): Array<Record<string, unknown>> {
@@ -2314,6 +3352,12 @@ function requireManualImportPath(paths: VaultPaths, path: string): string {
 function assertWritable(readOnly: boolean, action: string): void {
   if (readOnly) {
     throw new Error(`${action} is disabled in read-only HTTP mode`);
+  }
+}
+
+function assertLocalFilesystemAccess(options: HttpMcpServerOptions, actor: HostedActor, action: string): void {
+  if (options.hosted?.enabled && actor.provider !== "local" && !actor.roles.includes("system")) {
+    throw new HttpStatusError(403, `${action} is disabled for hosted accounts; upload the source into your isolated tenant inbox instead.`);
   }
 }
 

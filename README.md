@@ -50,6 +50,26 @@ Open:
 http://127.0.0.1:8765/index.html
 ```
 
+## Start Free Locally
+
+Use the local core when you want private, source-cited memory on your own machine:
+
+- import Markdown, text, JSONL, or PDFs
+- review extraction proposals before durable memory is applied
+- connect Claude, Codex, OpenClaw, or another MCP client over stdio
+
+## Hosted NeuraKeep
+
+Use the hosted app when you need Google or enterprise SAML/OIDC sign-in, private personal vaults,
+isolated shared Team spaces, remote MCP over HTTPS, managed storage, backups, and Stripe-managed
+billing. Team workspaces include owner/admin/reviewer/editor/viewer roles, email-bound invitations,
+audit history, licensed seats, and SCIM provisioning. Hosted access requires an active individual or
+Team subscription; space-bound service tokens remain available for controlled MCP clients.
+
+The public package contains the complete local-first core. Managed authentication, Stripe billing,
+Team tenancy, SSO, SCIM, deployment automation, and production credentials remain part of the
+hosted service and are not required to run NeuraKeep locally.
+
 ## CLI Examples
 
 ```bash
@@ -84,10 +104,11 @@ node dist/cli/index.js serve --root .umos --host 127.0.0.1 --port 8765 --ui
 
 Use `--token` or `NEURAKEEP_MCP_TOKEN` before exposing any HTTP endpoint outside your machine.
 
-## Open Source Scope
+## Free vs Paid
 
-This repository is the local, self-managed NeuraKeep core: CLI, local vault, local UI,
-local MCP, imports, search, graph, proposal review, and memory quality tools.
+The open-source version is for local, self-managed memory. The hosted product adds managed auth,
+team spaces, remote connectors, shared storage, backups, and administration. See
+[NeuraKeep pricing](https://www.neurakeep.com/#pricing) for the current hosted plans.
 
 ## Docs
 
@@ -102,6 +123,7 @@ npm run typecheck
 npm run build:all
 npm test
 npm run e2e
+npm run check:secrets
 ```
 
 ## License

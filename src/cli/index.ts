@@ -69,8 +69,11 @@ program
   .option("--host <host>", "Bind host. Defaults to 127.0.0.1.")
   .option("--port <number>", "Bind port. Defaults to 8890.")
   .option("--token <token>", "Require Authorization: Bearer <token> for POST /mcp.")
+  .option("--service-token <token>", "Allow a bearer service token for remote MCP/API access. Can be repeated or set with NEURAKEEP_SERVICE_TOKENS.")
   .option("--read-write", "Allow proposal/apply tools over HTTP. Default is read-only.")
   .option("--ui", "Serve the local NeuraKeep app from the same process.")
+  .option("--hosted", "Enable hosted mode and require Firebase Authentication ID tokens for /api and POST /mcp.")
+  .option("--firebase-project <id>", "Firebase project ID for hosted mode token verification.")
   .action(serveCommand);
 
 program

@@ -3,11 +3,42 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NeuraKeep</title>
+    <title>Hosted NeuraKeep | Secure Sign In</title>
+    <meta name="description" content="Sign in to hosted NeuraKeep to access your private, source-cited AI memory workspace." />
+    <meta name="robots" content="noindex, nofollow, noarchive" />
+    <meta name="googlebot" content="noindex, nofollow, noarchive" />
+    <link rel="canonical" href="https://www.neurakeep.com/app" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="NeuraKeep" />
+    <meta property="og:title" content="Hosted NeuraKeep | Secure Sign In" />
+    <meta property="og:description" content="Sign in to hosted NeuraKeep to access your private, source-cited AI memory workspace." />
+    <meta property="og:url" content="https://www.neurakeep.com/app" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Hosted NeuraKeep | Secure Sign In" />
+    <meta name="twitter:description" content="Sign in to hosted NeuraKeep to access your private, source-cited AI memory workspace." />
     <link rel="icon" href="/assets/icon.svg" type="image/svg+xml" />
+    <script>
+      (function () {
+        var id = "%VITE_GA_MEASUREMENT_ID%";
+        if (!id || id.indexOf("%") !== -1) return;
+        window.dataLayer = window.dataLayer || [];
+        window.gtag = window.gtag || function () { window.dataLayer.push(arguments); };
+        var script = document.createElement("script");
+        script.async = true;
+        script.src = "https://www.googletagmanager.com/gtag/js?id=" + encodeURIComponent(id);
+        document.head.appendChild(script);
+        window.gtag("js", new Date());
+        window.gtag("config", id);
+      })();
+    </script>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <main aria-label="Hosted NeuraKeep sign in">
+        <h1>Hosted NeuraKeep</h1>
+        <p>Sign in to access your private or shared, source-cited AI memory workspace.</p>
+      </main>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
