@@ -2454,8 +2454,22 @@ function handleHttpRequest(
   }
 
   if (payload.method === "tools/call") {
-    const name = String((payload.params as Record<string, unknown> | undefined)?.name ?? "");
-    assertHostedCapability(actor, capabilityForMcpTool(name));
+    try {
+      const name = String((payload.params as Record<string, unknown> | undefined)?.name ?? "");
+      assertHostedCapability(actor, capabilityForMcpTool(name));
+      return handleJsonRpcRequest(db, paths, payload);
+    } catch (error) {
+      if (payload.id === undefined) return null;
+      const statusCode = Number((error as { statusCode?: number })?.statusCode ?? 500);
+      return {
+        jsonrpc: "2.0",
+        id: payload.id,
+        error: {
+          code: statusCode === 403 ? -32003 : -32000,
+          message: error instanceof Error ? error.message : String(error)
+        }
+      };
+    }
   }
 
   return handleJsonRpcRequest(db, paths, payload);
@@ -3694,7 +3708,7 @@ function sendOAuthError(res: ServerResponse, error: unknown): void {
 
 function sendUnauthorized(res: ServerResponse, req: IncomingMessage, options: HttpMcpServerOptions): void {
   const metadata = `${publicBaseUrl(req, options)}/.well-known/oauth-protected-resource/mcp`;
-  res.setHeader("www-authenticate", `Bearer resource_metadata="${metadata}", scope="memory:read memory:propose"`);
+  res.setHeader("www-authenticate", `Bearer resource_metadata="${metadata}", scope="memory:read memory:propose memory:apply"`);
   sendJson(res, 401, { error: "unauthorized" });
 }
 

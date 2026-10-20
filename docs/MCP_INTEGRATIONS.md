@@ -109,7 +109,10 @@ The card is generated from the same manifest as MCP `tools/list`, declares OAuth
 
 Claude and other compatible remote clients discover NeuraKeep's OAuth endpoints, register dynamically,
 open the browser for NeuraKeep/Firebase sign-in, and ask the user to approve the selected space and
-scopes. Signed-in customers can still create and revoke manual tenant-bound grants in Settings for
+scopes. The standard hosted OAuth consent requests `memory:read`, `memory:propose`, and `memory:apply`
+so all six advertised tools are available after explicit consent. A connector may still request a
+smaller scope set; a read/propose-only grant receives a structured JSON-RPC permission error if it
+attempts to apply a proposal. Signed-in customers can still create and revoke manual tenant-bound grants in Settings for
 clients that need non-interactive bearer-token configuration. Raw grant values are displayed once and
 must never be committed to a repository.
 
@@ -135,5 +138,9 @@ administration, not shared customer access.
 3. Tool list: send JSON-RPC `tools/list`
 4. Search: call `memory_search` for `do not repeat`
 5. Read: call `memory_read` for one result ID
+6. Save a canary with `memory_save`, inspect it with `memory_explain_sources`, and create a second proposal with `memory_propose_update`
+7. Apply only that explicitly reviewed canary proposal with `memory_apply_update`
 
-Do not mark an integration healthy unless the search response includes structured content, citation IDs, and `guidance.recommendedNextStep`.
+Do not mark an integration healthy unless all six tools are advertised, every call returns a valid
+JSON-RPC response, and the search response includes structured content, citation IDs, and
+`guidance.recommendedNextStep`.

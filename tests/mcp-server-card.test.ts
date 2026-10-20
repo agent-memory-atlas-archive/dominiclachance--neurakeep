@@ -79,7 +79,7 @@ describe("MCP static server card", () => {
 
   it("uses the same version as the published package metadata", () => {
     const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
-    expect(NEURAKEEP_VERSION).toBe("0.3.1");
+    expect(NEURAKEEP_VERSION).toBe("0.3.2");
     expect(packageJson.version).toBe(NEURAKEEP_VERSION);
   });
 
@@ -172,6 +172,50 @@ describe("MCP static server card", () => {
       });
       expect(db.prepare("SELECT COUNT(*) AS count FROM sources").get()).toEqual({ count: 1 });
       expect(db.prepare("SELECT COUNT(*) AS count FROM proposals").get()).toEqual({ count: 1 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("executes every advertised tool through the local MCP dispatcher", () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "neurakeep-local-tools-"));
+    tempRoots.push(projectDir);
+    const root = join(projectDir, ".umos");
+    initCommand({ root });
+    const paths = getVaultPaths(root);
+    const db = openDatabase(paths.dbPath);
+    const call = (id: number, name: string, args: Record<string, unknown>) => handleJsonRpcRequest(db, paths, {
+      jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args }
+    });
+
+    try {
+      const listed = handleJsonRpcRequest(db, paths, { jsonrpc: "2.0", id: 1, method: "tools/list" });
+      expect(((listed?.result as any).tools as Array<{ name: string }>).map((tool) => tool.name)).toEqual([
+        "memory_search", "memory_read", "memory_explain_sources", "memory_save", "memory_propose_update", "memory_apply_update"
+      ]);
+
+      const saved = call(2, "memory_save", {
+        title: "Local MCP tool matrix",
+        content: "# Decision\n\nDominic decided that local NeuraKeep MCP clients may apply explicitly reviewed proposals."
+      });
+      const savedContent = (saved?.result as any).structuredContent as { sourceId: string; sectionIds: string[] };
+      expect(savedContent.sourceId).toMatch(/^src_/);
+
+      const searched = call(3, "memory_search", { query: "explicitly reviewed proposals" });
+      expect((searched?.result as any).structuredContent.results).toHaveLength(1);
+
+      const read = call(4, "memory_read", { id: savedContent.sectionIds[0] });
+      expect((read?.result as any).structuredContent.record.id).toBe(savedContent.sectionIds[0]);
+
+      const explained = call(5, "memory_explain_sources", { source_ids: [savedContent.sourceId] });
+      expect((explained?.result as any).structuredContent.sources).toHaveLength(1);
+
+      const proposed = call(6, "memory_propose_update", { source_id: savedContent.sourceId });
+      const proposalId = (proposed?.result as any).structuredContent.proposalId as string;
+      expect(proposalId).toMatch(/^prop_/);
+
+      const applied = call(7, "memory_apply_update", { proposal_id: proposalId });
+      expect((applied?.result as any).structuredContent.proposalId).toBe(proposalId);
     } finally {
       db.close();
     }
