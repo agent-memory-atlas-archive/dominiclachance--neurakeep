@@ -7,6 +7,7 @@ NeuraKeep exposes the same memory tools over stdio MCP and local HTTP MCP.
 - `memory_search` - ranked search with citations, confidence guidance, related failures, and neighbor context.
 - `memory_read` - read a source, section, event, fact, failure, or proposal.
 - `memory_explain_sources` - inspect citation provenance.
+- `memory_save` - save new text as a searchable source and queue a structured-memory proposal for review.
 - `memory_propose_update` - create a pending proposal from an ingested source.
 - `memory_apply_update` - apply a reviewed pending proposal.
 
@@ -49,7 +50,7 @@ Use stdio MCP for local agent memory. The command should point at the built CLI:
 }
 ```
 
-Keep write behavior queue-first: agents may call `memory_propose_update`, but durable application should stay review-gated.
+For requests such as "remember this," agents should call `memory_save`. The source is searchable immediately, while extracted facts stay queue-first and review-gated. Use `memory_propose_update` only when the source is already ingested and its `source_id` is known.
 
 ## Claude Code
 
@@ -60,7 +61,7 @@ claude mcp add neurakeep node C:/path/to/neurakeep/dist/cli/index.js mcp --root 
 claude mcp get neurakeep
 ```
 
-Smoke expectation: `claude mcp get neurakeep` reports connected, and `tools/list` includes the five NeuraKeep tools above.
+Smoke expectation: `claude mcp get neurakeep` reports connected, and `tools/list` includes the six NeuraKeep tools above.
 
 ## Claude Desktop
 

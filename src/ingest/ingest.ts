@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -27,6 +27,12 @@ export interface IngestResult {
   riskFlags: string[];
 }
 
+export interface IngestTextInput extends MemoryMetadata {
+  content: string;
+  title?: string;
+  kind?: "note" | "markdown";
+}
+
 export function ingestFile(
   db: UmosDatabase,
   paths: VaultPaths,
@@ -34,6 +40,43 @@ export function ingestFile(
 ): IngestResult {
   const sourcePath = resolve(input.path);
   const content = readFileSync(sourcePath);
+  return ingestContent(db, paths, {
+    ...input,
+    sourcePath,
+    title: basename(sourcePath),
+    content
+  });
+}
+
+export function ingestText(
+  db: UmosDatabase,
+  paths: VaultPaths,
+  input: IngestTextInput
+): IngestResult {
+  const contentText = input.content.trim();
+  if (!contentText) {
+    throw new Error("content must be a non-empty string");
+  }
+  if (Buffer.byteLength(contentText, "utf8") > 100_000) {
+    throw new Error("content must be 100000 UTF-8 bytes or fewer");
+  }
+  const kind = input.kind ?? "markdown";
+  const title = safeTextTitle(input.title, kind);
+  return ingestContent(db, paths, {
+    ...input,
+    kind,
+    sourcePath: `mcp://memory-save/${encodeURIComponent(title)}`,
+    title,
+    content: Buffer.from(contentText, "utf8")
+  });
+}
+
+function ingestContent(
+  db: UmosDatabase,
+  paths: VaultPaths,
+  input: MemoryMetadata & { sourcePath: string; title: string; kind: IngestInput["kind"]; content: Buffer }
+): IngestResult {
+  const { sourcePath, content, title } = input;
   const extracted = extractIndexText(input.kind, sourcePath, content);
   const contentText = extracted.text;
   const contentHash = sha256(content);
@@ -58,8 +101,7 @@ export function ingestFile(
   const now = new Date().toISOString();
   const episodeId = createId("ep");
   const sourceId = createId("src");
-  const rawPath = copyRawEpisode(paths, episodeId, sourcePath, content);
-  const title = basename(sourcePath);
+  const rawPath = copyRawEpisode(paths, episodeId, title, content);
   const sections = splitContentIntoSections(input.kind, contentText);
   const sectionIds = sections.map(() => createId("sec"));
 
@@ -268,20 +310,26 @@ interface ExistingSource {
   raw_path: string;
 }
 
-function copyRawEpisode(paths: VaultPaths, episodeId: string, sourcePath: string, content: Buffer): string {
+function copyRawEpisode(paths: VaultPaths, episodeId: string, sourceName: string, content: Buffer): string {
   const rawDir = join(paths.rawDir, "episodes");
   mkdirSync(rawDir, { recursive: true });
-  const extension = extname(sourcePath) || ".txt";
+  const extension = extname(sourceName) || ".txt";
   const rawPath = join(rawDir, `${episodeId}${extension}`);
   const store = hostedArtifactStore(paths.root);
   if (store) return store.write(rawPath, content, "raw");
-  const { copyFileSync } = requireFs();
-  copyFileSync(sourcePath, rawPath);
+  writeFileSync(rawPath, content);
   return rawPath;
 }
 
-function requireFs(): typeof import("node:fs") {
-  return createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
+function safeTextTitle(value: string | undefined, kind: "note" | "markdown"): string {
+  const fallback = `mcp-memory-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const base = (value?.trim() || fallback)
+    .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, "-")
+    .replace(/\s+/g, " ")
+    .slice(0, 120)
+    .trim();
+  const extension = kind === "markdown" ? ".md" : ".txt";
+  return extname(base) ? base : `${base}${extension}`;
 }
 
 function selectSectionIds(db: UmosDatabase, sourceId: string): string[] {

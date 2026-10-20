@@ -79,7 +79,7 @@ describe("MCP static server card", () => {
 
   it("uses the same version as the published package metadata", () => {
     const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
-    expect(NEURAKEEP_VERSION).toBe("0.3.0");
+    expect(NEURAKEEP_VERSION).toBe("0.3.1");
     expect(packageJson.version).toBe(NEURAKEEP_VERSION);
   });
 
@@ -92,8 +92,86 @@ describe("MCP static server card", () => {
     const db = openDatabase(paths.dbPath);
     try {
       expect(handleJsonRpcRequest(db, paths, { jsonrpc: "2.0", method: "notifications/cancelled", params: {} })).toBeNull();
+      const saveTool = neurakeepTools().find((tool) => tool.name === "memory_save");
+      expect(saveTool).toMatchObject({
+        description: expect.stringMatching(/save or remember new text/i),
+        inputSchema: {
+          required: ["content"],
+          properties: {
+            content: { type: "string", description: expect.any(String) },
+            title: { type: "string", description: expect.any(String) }
+          }
+        },
+        annotations: {
+          title: "Save memory",
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false
+        }
+      });
       const proposalTool = neurakeepTools().find((tool) => tool.name === "memory_propose_update");
       expect(proposalTool?.inputSchema.properties).toEqual({ source_id: { type: "string" } });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("saves new text as searchable memory and queues one review-gated proposal", () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "neurakeep-save-memory-"));
+    tempRoots.push(projectDir);
+    const root = join(projectDir, ".umos");
+    initCommand({ root });
+    const paths = getVaultPaths(root);
+    const db = openDatabase(paths.dbPath);
+    const request = {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "memory_save",
+        arguments: {
+          title: "Claude memory save test",
+          content: "# Preference\n\nDominic prefers teal interfaces and concise release reports."
+        }
+      }
+    };
+
+    try {
+      const first = handleJsonRpcRequest(db, paths, request);
+      const firstSaved = (first?.result as { structuredContent: Record<string, unknown> }).structuredContent;
+      expect(firstSaved).toMatchObject({
+        saved: true,
+        status: "saved_pending_review",
+        searchableNow: true,
+        durableAutoApplied: false,
+        reviewRequired: true,
+        proposalId: expect.stringMatching(/^prop_/),
+        sourceId: expect.stringMatching(/^src_/)
+      });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM sources").get()).toEqual({ count: 1 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM proposals WHERE status = 'pending'").get()).toEqual({ count: 1 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM facts").get()).toEqual({ count: 0 });
+
+      const search = handleJsonRpcRequest(db, paths, {
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: { name: "memory_search", arguments: { query: "teal interfaces" } }
+      });
+      const searchContent = (search?.result as { structuredContent: { results: unknown[] } }).structuredContent;
+      expect(searchContent.results).toHaveLength(1);
+
+      const duplicate = handleJsonRpcRequest(db, paths, { ...request, id: 5 });
+      const duplicateSaved = (duplicate?.result as { structuredContent: Record<string, unknown> }).structuredContent;
+      expect(duplicateSaved).toMatchObject({
+        saved: true,
+        status: "already_saved",
+        proposalId: null,
+        reviewRequired: false
+      });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM sources").get()).toEqual({ count: 1 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM proposals").get()).toEqual({ count: 1 });
     } finally {
       db.close();
     }

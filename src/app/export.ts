@@ -17,7 +17,7 @@ export interface AppExportResult {
 interface GraphNode {
   id: string;
   label: string;
-  type: "root" | "source" | "section" | "event" | "fact" | "failure";
+  type: "root" | "source" | "section" | "event" | "decision" | "fact" | "failure";
   space?: string;
   trustLevel?: string;
   sensitivity?: string;
@@ -149,7 +149,7 @@ export function buildGraph(db: UmosDatabase): GraphPayload {
     }
   }
 
-  addCitedRows(db, "events", "event", "summary", addNode, edges);
+  addEventRows(db, addNode, edges);
   addCitedRows(db, "facts", "fact", "subject", addNode, edges);
   addCitedRows(db, "failures", "failure", "attempted", addNode, edges);
   addRootTopology(nodes, edges, addNode);
@@ -245,6 +245,7 @@ function nodePriority(node: GraphNode): number {
   const typeScore = {
     root: 100,
     failure: 80,
+    decision: 75,
     event: 70,
     fact: 60,
     source: 50,
@@ -270,9 +271,44 @@ function addRootTopology(nodes: GraphNode[], edges: GraphEdge[], addNode: (node:
   for (const node of nodes) {
     if (node.type === "source") edges.push({ from: "root:sources", to: node.id, type: "root" });
     if (node.type === "section") edges.push({ from: "root:sections", to: node.id, type: "root" });
-    if (node.type === "event") edges.push({ from: "root:decisions", to: node.id, type: "root" });
+    if (node.type === "event" || node.type === "decision") edges.push({ from: "root:decisions", to: node.id, type: "root" });
     if (node.type === "fact") edges.push({ from: "root:facts", to: node.id, type: "root" });
     if (node.type === "failure") edges.push({ from: "root:failures", to: node.id, type: "root" });
+  }
+}
+
+function addEventRows(
+  db: UmosDatabase,
+  addNode: (node: GraphNode) => void,
+  edges: GraphEdge[]
+): void {
+  const rows = db
+    .prepare(
+      "SELECT id, summary AS label, type, source_ids_json, section_ids_json, space, trust_level, sensitivity FROM events"
+    )
+    .all() as Array<{
+    id: string;
+    label: string;
+    type: string;
+    source_ids_json: string;
+    section_ids_json: string;
+    space: string;
+    trust_level: string;
+    sensitivity: string;
+  }>;
+
+  for (const row of rows) {
+    addNode({
+      id: row.id,
+      label: row.label,
+      type: row.type.toLowerCase().includes("decision") ? "decision" : "event",
+      space: row.space,
+      trustLevel: row.trust_level,
+      sensitivity: row.sensitivity
+    });
+    for (const cited of [...parseArray(row.source_ids_json), ...parseArray(row.section_ids_json)]) {
+      edges.push({ from: row.id, to: cited, type: "cites" });
+    }
   }
 }
 

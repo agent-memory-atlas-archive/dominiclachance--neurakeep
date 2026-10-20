@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline";
 import type { VaultPaths } from "../core/paths.js";
 import { migrateDatabase, openDatabase, type UmosDatabase } from "../db/client.js";
+import { ingestText } from "../ingest/ingest.js";
 import { applyProposal, proposeSourceExtraction } from "../memory/proposals.js";
 import { explainSources, readMemoryRecord } from "../memory/records.js";
 import { retrievalGuidance, searchSections } from "../search/fts.js";
@@ -122,6 +123,37 @@ function callTool(
   if (name === "memory_explain_sources") {
     const sourceIds = arrayArg(args.source_ids, "source_ids");
     return content({ sources: explainSources(db, sourceIds) });
+  }
+
+  if (name === "memory_save") {
+    const ingest = ingestText(db, paths, {
+      content: stringArg(args.content, "content"),
+      title: optionalString(args.title),
+      kind: "markdown",
+      space: "personal",
+      trustLevel: "observed",
+      sourceOrigin: "agent",
+      visibility: "private",
+      sensitivity: "internal"
+    });
+    const proposal = ingest.skipped
+      ? null
+      : proposeSourceExtraction(db, ingest.sourceId, {
+          extractor: "deterministic",
+          reportPaths: paths
+        });
+    return content({
+      saved: true,
+      status: ingest.skipped ? "already_saved" : "saved_pending_review",
+      sourceId: ingest.sourceId,
+      sectionIds: ingest.sectionIds,
+      proposalId: proposal?.proposalId ?? null,
+      proposalSummary: proposal?.summary ?? null,
+      searchableNow: true,
+      durableAutoApplied: false,
+      reviewRequired: Boolean(proposal),
+      riskFlags: ingest.riskFlags
+    });
   }
 
   if (name === "memory_propose_update") {

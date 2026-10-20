@@ -16,11 +16,12 @@ a shared, source-cited memory layer that runs on your own machine.
   - `memory_search`
   - `memory_read`
   - `memory_explain_sources`
+  - `memory_save` (stores new text immediately and queues structured memory for review)
   - `memory_propose_update`
   - `memory_apply_update`
 
-The core rule is simple: agents can propose memory, but durable memory should be reviewable and
-source-cited.
+The core rule is simple: agents can save new source memory immediately, but extracted durable facts
+remain reviewable and source-cited.
 
 ## Local Install
 

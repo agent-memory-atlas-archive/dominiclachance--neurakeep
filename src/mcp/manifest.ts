@@ -1,4 +1,4 @@
-export const NEURAKEEP_VERSION = "0.3.0";
+export const NEURAKEEP_VERSION = "0.3.1";
 
 export const NEURAKEEP_SERVER_INFO = {
   name: "neurakeep",
@@ -41,8 +41,27 @@ const toolDefinitions: Array<Record<string, unknown>> = [
     }
   },
   {
+    name: "memory_save",
+    description: "Save or remember new text in NeuraKeep. The source becomes searchable immediately and a structured-memory proposal is queued for human review; this tool never auto-applies durable facts.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "The information the user asked NeuraKeep to remember." },
+        title: { type: "string", description: "Optional short source title for the saved memory." }
+      },
+      required: ["content"]
+    },
+    annotations: {
+      title: "Save memory",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  },
+  {
     name: "memory_propose_update",
-    description: "Create a pending cited structured-memory proposal from an ingested source.",
+    description: "Create a pending structured-memory proposal from an existing ingested source_id. Use memory_save when the user gives you new text to remember.",
     inputSchema: {
       type: "object",
       properties: {

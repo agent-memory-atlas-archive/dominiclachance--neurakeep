@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { readGraphState, writeGraphState } from "../app/state.js";
 import type { VaultPaths } from "../core/paths.js";
 import { migrateDatabase, openDatabase, type UmosDatabase } from "../db/client.js";
-import { exportStaticApp, buildGraphView } from "../app/export.js";
+import { exportStaticApp, buildGraph, buildGraphView } from "../app/export.js";
 import { ingestFile } from "../ingest/ingest.js";
 import { redactSensitiveContent, scanContentForSafety } from "../ingest/security.js";
 import {
@@ -758,6 +758,21 @@ async function handleApiRequest(
     });
     exportStaticApp(db, paths);
     sendJson(res, 200, { ...graph, state: readGraphState(paths) });
+    return;
+  }
+
+  if (url.pathname === "/api/graph/overview" && req.method === "GET") {
+    sendJson(res, 200, graphOverviewCompat(db, url.searchParams.get("clusterBy")));
+    return;
+  }
+
+  if (url.pathname === "/api/graph/neighbors" && req.method === "GET") {
+    sendJson(res, 200, graphNeighborsCompat(db, url.searchParams));
+    return;
+  }
+
+  if (url.pathname === "/api/graph/locate" && req.method === "GET") {
+    sendJson(res, 200, graphLocateCompat(db, url.searchParams));
     return;
   }
 
@@ -2156,7 +2171,7 @@ function integrationStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcp
       note: "Use the same stdio command in the MCP host or the local HTTP endpoint when available."
     }
   ];
-  const toolNames = ["memory_search", "memory_read", "memory_explain_sources", "memory_propose_update", "memory_apply_update"];
+  const toolNames = ["memory_search", "memory_read", "memory_explain_sources", "memory_save", "memory_propose_update", "memory_apply_update"];
   const serviceTokens = serviceTokenConfigs(options);
   const localBase = `http://${options.host}:${options.port}`;
   const publicBase = process.env.NEURAKEEP_PUBLIC_URL?.replace(/\/+$/, "") ?? localBase;
@@ -2195,6 +2210,7 @@ function integrationStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcp
     smokeTests: [
       { name: "search", tool: "memory_search", arguments: { query: "deployment decisions and known failures", limit: 5, neighbors: 1 } },
       { name: "read", tool: "memory_read", note: "Use an id returned by memory_search." },
+      { name: "save", tool: "memory_save", note: "Saves new text as a searchable source and queues a proposal; never auto-applies." },
       { name: "propose", tool: "memory_propose_update", note: "Creates a pending proposal only; review before applying." },
       { name: "apply", tool: "memory_apply_update", note: "Only use after explicit approval or a clean reviewed proposal." }
     ],
@@ -2428,7 +2444,7 @@ function handleHttpRequest(
 
   if (readOnly && payload.method === "tools/call") {
     const name = String((payload.params as Record<string, unknown> | undefined)?.name ?? "");
-    if (name === "memory_propose_update" || name === "memory_apply_update") {
+    if (name === "memory_save" || name === "memory_propose_update" || name === "memory_apply_update") {
       return {
         jsonrpc: "2.0",
         id: payload.id,
@@ -2539,6 +2555,154 @@ async function authorizeRequest(req: IncomingMessage, db: UmosDatabase, options:
   return req.headers.authorization === expected ? localActor() : null;
 }
 
+type CompatGraphNode = ReturnType<typeof buildGraph>["nodes"][number];
+type CompatGraphEdge = ReturnType<typeof buildGraph>["edges"][number];
+type CompatClusterBy = "type" | "space" | "trust" | "sensitivity";
+
+function graphOverviewCompat(db: UmosDatabase, clusterByValue: string | null): Record<string, unknown> {
+  const clusterBy = compatClusterBy(clusterByValue);
+  const graph = compatContentGraph(db);
+  const degree = compatDegrees(graph.edges);
+  const grouped = new Map<string, CompatGraphNode[]>();
+  for (const node of graph.nodes) {
+    const key = compatClusterValue(node, clusterBy);
+    grouped.set(key, [...(grouped.get(key) ?? []), node]);
+  }
+  const clusters = Array.from(grouped.entries())
+    .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))
+    .map(([key, nodes]) => ({
+      id: compatClusterId(clusterBy, key),
+      key,
+      label: key.replaceAll(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase()),
+      kind: clusterBy,
+      count: nodes.length,
+      sampleIds: nodes.slice(0, 5).map((node) => node.id)
+    }));
+  const clusterIds = new Set(clusters.map((cluster) => cluster.id));
+  const hubs = graph.nodes
+    .filter((node) => node.type !== "section")
+    .sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0) || a.id.localeCompare(b.id))
+    .slice(0, 20)
+    .map((node) => ({ ...node, degree: degree.get(node.id) ?? 0 }));
+  const edges: Array<{ from: string; to: string; type: "root" | "cluster" }> = clusters.map((cluster) => ({
+    from: "root:neurakeep",
+    to: cluster.id,
+    type: "root"
+  }));
+  for (const hub of hubs) {
+    const clusterId = compatClusterId(clusterBy, compatClusterValue(hub, clusterBy));
+    if (clusterIds.has(clusterId)) edges.push({ from: clusterId, to: hub.id, type: "cluster" });
+  }
+  return {
+    root: { id: "root:neurakeep", label: "NeuraKeep", type: "root", count: graph.nodes.length },
+    clusters,
+    hubs,
+    edges,
+    generatedAt: new Date().toISOString()
+  };
+}
+
+function graphNeighborsCompat(db: UmosDatabase, params: URLSearchParams): Record<string, unknown> {
+  const id = String(params.get("id") ?? "").trim();
+  if (!id) throw Object.assign(new Error("id is required"), { statusCode: 400 });
+  const limit = Math.max(1, Math.min(2_000, Math.trunc(Number(params.get("limit") ?? 200)) || 200));
+  const graph = compatContentGraph(db);
+  const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
+  const degree = compatDegrees(graph.edges);
+  const cluster = compatParseClusterId(id);
+  let candidates: CompatGraphNode[];
+  let relevantEdges: CompatGraphEdge[] = [];
+  if (cluster) {
+    candidates = graph.nodes.filter((node) => compatClusterValue(node, cluster.clusterBy) === cluster.key);
+  } else {
+    if (!nodeById.has(id)) throw Object.assign(new Error("graph node not found"), { statusCode: 404 });
+    const neighborIds = new Set<string>();
+    relevantEdges = graph.edges.filter((edge) => {
+      if (edge.from === id) {
+        neighborIds.add(edge.to);
+        return true;
+      }
+      if (edge.to === id) {
+        neighborIds.add(edge.from);
+        return true;
+      }
+      return false;
+    });
+    candidates = Array.from(neighborIds, (neighborId) => nodeById.get(neighborId)).filter(
+      (node): node is CompatGraphNode => Boolean(node)
+    );
+  }
+  candidates.sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0) || a.id.localeCompare(b.id));
+  const offset = Math.max(0, Math.trunc(Number(params.get("cursor") ?? 0)) || 0);
+  const page = candidates.slice(offset, offset + limit).map((node) => ({ ...node, degree: degree.get(node.id) ?? 0 }));
+  const pageIds = new Set(page.map((node) => node.id));
+  const edges = cluster
+    ? page.map((node) => ({ from: id, to: node.id, type: "cluster" as const }))
+    : relevantEdges
+        .filter((edge) => pageIds.has(edge.from === id ? edge.to : edge.from))
+        .map((edge) => ({ ...edge, type: edge.type === "next" ? "contains" : edge.type }));
+  const consumed = Math.min(candidates.length, offset + page.length);
+  return {
+    nodes: page,
+    edges,
+    nextCursor: consumed < candidates.length ? String(consumed) : null,
+    remaining: Math.max(0, candidates.length - consumed),
+    total: candidates.length
+  };
+}
+
+function graphLocateCompat(db: UmosDatabase, params: URLSearchParams): Record<string, unknown> {
+  const id = params.get("id")?.trim();
+  const query = params.get("q")?.trim().toLocaleLowerCase() ?? "";
+  const limit = Math.max(1, Math.min(100, Math.trunc(Number(params.get("limit") ?? 20)) || 20));
+  const graph = compatContentGraph(db);
+  const degree = compatDegrees(graph.edges);
+  const matches = graph.nodes
+    .filter((node) => id ? node.id === id : query && (node.id.toLocaleLowerCase().startsWith(query) || node.label.toLocaleLowerCase().includes(query)))
+    .sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0) || a.id.localeCompare(b.id))
+    .slice(0, limit)
+    .map((node) => ({ ...node, degree: degree.get(node.id) ?? 0 }));
+  return { nodes: matches };
+}
+
+function compatContentGraph(db: UmosDatabase): ReturnType<typeof buildGraph> {
+  const graph = buildGraph(db);
+  const nodes = graph.nodes.filter((node) => node.type !== "root");
+  const ids = new Set(nodes.map((node) => node.id));
+  return { nodes, edges: graph.edges.filter((edge) => ids.has(edge.from) && ids.has(edge.to)) };
+}
+
+function compatDegrees(edges: CompatGraphEdge[]): Map<string, number> {
+  const degree = new Map<string, number>();
+  for (const edge of edges) {
+    degree.set(edge.from, (degree.get(edge.from) ?? 0) + 1);
+    degree.set(edge.to, (degree.get(edge.to) ?? 0) + 1);
+  }
+  return degree;
+}
+
+function compatClusterBy(value: string | null): CompatClusterBy {
+  if (!value || value === "type") return "type";
+  if (value === "space" || value === "trust" || value === "sensitivity") return value;
+  throw Object.assign(new Error("clusterBy must be type, space, trust, or sensitivity"), { statusCode: 400 });
+}
+
+function compatClusterValue(node: CompatGraphNode, clusterBy: CompatClusterBy): string {
+  if (clusterBy === "type") return node.type;
+  if (clusterBy === "space") return node.space ?? "unknown";
+  if (clusterBy === "trust") return node.trustLevel ?? "unknown";
+  return node.sensitivity ?? "unknown";
+}
+
+function compatClusterId(clusterBy: CompatClusterBy, key: string): string {
+  return `cluster:${clusterBy}:${Buffer.from(key, "utf8").toString("base64url")}`;
+}
+
+function compatParseClusterId(id: string): { clusterBy: CompatClusterBy; key: string } | null {
+  const match = /^cluster:(type|space|trust|sensitivity):([A-Za-z0-9_-]+)$/.exec(id);
+  return match ? { clusterBy: match[1] as CompatClusterBy, key: Buffer.from(match[2], "base64url").toString("utf8") } : null;
+}
+
 function authSettings(paths: VaultPaths, options: HttpMcpServerOptions, actor: HostedActor = localActor(), db?: UmosDatabase): Record<string, unknown> {
   const saved = readAuthSettings(paths);
   const serviceTokens = serviceTokenConfigs(options);
@@ -2551,6 +2715,12 @@ function authSettings(paths: VaultPaths, options: HttpMcpServerOptions, actor: H
     hasToken: Boolean(options.token),
     serviceTokenConfigured: serviceTokens.length > 0,
     endpoint: "/mcp",
+    flags: {
+      graph: {
+        engine: process.env.NEURAKEEP_FLAG_GRAPH_ENGINE === "sigma" ? "sigma" : "legacy",
+        universe: ["1", "true"].includes((process.env.NEURAKEEP_FLAG_GRAPH_UNIVERSE ?? "").toLowerCase())
+      }
+    },
     hosted: hostedStatus(options, actor, db),
     user: {
       ...saved.user,
