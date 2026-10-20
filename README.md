@@ -26,7 +26,7 @@ source-cited.
 
 Requirements:
 
-- Node.js 20+
+- Node.js 22+
 - npm
 
 ```bash
@@ -56,7 +56,10 @@ Use the hosted app when you need Google or enterprise SAML/OIDC sign-in, private
 isolated shared Team spaces, remote MCP over HTTPS, managed storage, backups, and Stripe-managed
 billing. Team workspaces include owner/admin/reviewer/editor/viewer roles, email-bound invitations,
 audit history, licensed seats, and SCIM provisioning. Hosted access requires an active individual or
-Team subscription; space-bound service tokens remain available for controlled MCP clients.
+Team subscription. OAuth-capable remote MCP clients use browser sign-in and explicit space consent with
+PKCE and rotating refresh tokens; space-bound, scoped, expiring manual grants remain available for
+non-interactive clients. Hosted autonomous spaces use application-level encryption at rest, but are not
+zero-knowledge because the authorized runtime decrypts them while working.
 
 The public package contains the complete local-first core. Managed authentication, Stripe billing,
 Team tenancy, SSO, SCIM, deployment automation, and production credentials remain part of the

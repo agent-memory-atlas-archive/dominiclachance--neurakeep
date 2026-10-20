@@ -4,19 +4,16 @@ import { existsSync } from "node:fs";
 import { resolve, join } from "node:path";
 
 const requiredAbsent = [
-  ".umos",
   ".env",
   ".env.local",
   ".env.production",
-  "dist",
-  "web-dist",
   "marketing-site",
-  "test-results",
   "docs/HOSTED_ARCHITECTURE.md",
   "docs/HOSTED_FIREBASE_MVP.md",
   "docs/REMOTE_TEAM_ARCHITECTURE.md",
   "docs/FEATURE_MATRIX.md"
 ];
+const forbiddenTracked = [...requiredAbsent, ".umos", "dist", "web-dist", "test-results", "playwright-report", "blob-report"];
 
 const root = resolve(process.cwd(), process.argv[2] ?? ".");
 const errors = [];
@@ -29,11 +26,9 @@ for (const path of requiredAbsent) {
   }
 }
 
-const tracked = execFileSync("git", ["ls-files"], { cwd: root, encoding: "utf8" });
-for (const path of requiredAbsent) {
-  if (tracked.split(/\r?\n/).includes(path)) {
-    errors.push(`Forbidden artifact is tracked: ${path}`);
-  }
+const tracked = execFileSync("git", ["ls-files"], { cwd: root, encoding: "utf8" }).split(/\r?\n/);
+for (const path of forbiddenTracked) {
+  if (tracked.some((file) => file === path || file.startsWith(`${path}/`))) errors.push(`Forbidden artifact is tracked: ${path}`);
 }
 
 if (!existsSync(join(root, "LICENSE"))) {

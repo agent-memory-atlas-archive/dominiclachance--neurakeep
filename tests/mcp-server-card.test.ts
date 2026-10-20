@@ -8,7 +8,7 @@ import { initCommand } from "../src/cli/commands/init.js";
 import { getVaultPaths } from "../src/core/paths.js";
 import { handleJsonRpcRequest } from "../src/mcp/server.js";
 import { NEURAKEEP_VERSION, neurakeepServerCard, neurakeepTools } from "../src/mcp/manifest.js";
-import { runHttpMcpServer } from "../src/mcp/http.js";
+import { assertSecureHttpBinding, runHttpMcpServer } from "../src/mcp/http.js";
 import { openDatabase } from "../src/db/client.js";
 
 const tempRoots: string[] = [];
@@ -50,10 +50,61 @@ describe("MCP static server card", () => {
     }
   });
 
+  it("negotiates the protocol version requested by current MCP clients", () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "neurakeep-protocol-negotiation-"));
+    tempRoots.push(projectDir);
+    const root = join(projectDir, ".umos");
+    initCommand({ root });
+    const paths = getVaultPaths(root);
+    const db = openDatabase(paths.dbPath);
+    try {
+      const initialize = handleJsonRpcRequest(db, paths, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-11-25" }
+      });
+      expect((initialize?.result as { protocolVersion: string }).protocolVersion).toBe("2025-11-25");
+      const unsupported = handleJsonRpcRequest(db, paths, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "initialize",
+        params: { protocolVersion: "2026-07-28" }
+      });
+      expect((unsupported?.result as { protocolVersion: string }).protocolVersion).toBe("2025-11-25");
+    } finally {
+      db.close();
+    }
+  });
+
   it("uses the same version as the published package metadata", () => {
     const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
-    expect(NEURAKEEP_VERSION).toBe("0.2.0");
+    expect(NEURAKEEP_VERSION).toBe("0.3.0");
     expect(packageJson.version).toBe(NEURAKEEP_VERSION);
+  });
+
+  it("does not answer JSON-RPC notifications and does not advertise command execution", () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "neurakeep-notification-"));
+    tempRoots.push(projectDir);
+    const root = join(projectDir, ".umos");
+    initCommand({ root });
+    const paths = getVaultPaths(root);
+    const db = openDatabase(paths.dbPath);
+    try {
+      expect(handleJsonRpcRequest(db, paths, { jsonrpc: "2.0", method: "notifications/cancelled", params: {} })).toBeNull();
+      const proposalTool = neurakeepTools().find((tool) => tool.name === "memory_propose_update");
+      expect(proposalTool?.inputSchema.properties).toEqual({ source_id: { type: "string" } });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("refuses unauthenticated non-loopback HTTP bindings", () => {
+    const base = { port: 8890, readOnly: true, serveUi: false };
+    expect(() => assertSecureHttpBinding({ ...base, host: "0.0.0.0" })).toThrow(/non-loopback host without authentication/);
+    expect(() => assertSecureHttpBinding({ ...base, host: "::" })).toThrow(/non-loopback host without authentication/);
+    expect(() => assertSecureHttpBinding({ ...base, host: "127.0.0.1" })).not.toThrow();
+    expect(() => assertSecureHttpBinding({ ...base, host: "0.0.0.0", token: "configured-at-runtime" })).not.toThrow();
   });
 
   it("serves metadata publicly without leaking vault content or credentials", async () => {
@@ -84,6 +135,11 @@ describe("MCP static server card", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })
       });
+      const notificationResponse = await fetch(`http://127.0.0.1:${address.port}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer top-secret-token" },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } })
+      });
 
       expect(response.status).toBe(200);
       expect(response.headers.get("content-type")).toContain("application/json");
@@ -92,6 +148,8 @@ describe("MCP static server card", () => {
       expect(text).not.toContain("top-secret-token");
       expect(text).not.toContain("another-secret-token");
       expect(protectedResponse.status).toBe(401);
+      expect(notificationResponse.status).toBe(202);
+      expect(await notificationResponse.text()).toBe("");
     } finally {
       server.close();
       await once(server, "close");

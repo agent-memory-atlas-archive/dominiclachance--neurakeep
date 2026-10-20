@@ -45,7 +45,7 @@ GET /api/import/ocr-health
 ```http
 POST /api/import
 {
-  "path": "C:\\Users\\macro\\Downloads\\paper.pdf",
+  "path": "C:\\path\\to\\paper.pdf",
   "kind": "auto"
 }
 ```

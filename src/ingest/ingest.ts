@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -10,6 +10,7 @@ import type { UmosDatabase } from "../db/client.js";
 import type { MemoryMetadata } from "../memory/metadata.js";
 import { downgradeTrustForSafety, scanContentForSafety } from "./security.js";
 import { splitContentIntoSections } from "./split.js";
+import { hostedArtifactStore } from "../security/artifact-store.js";
 
 export interface IngestInput extends MemoryMetadata {
   path: string;
@@ -57,7 +58,7 @@ export function ingestFile(
   const now = new Date().toISOString();
   const episodeId = createId("ep");
   const sourceId = createId("src");
-  const rawPath = copyRawEpisode(paths, episodeId, sourcePath);
+  const rawPath = copyRawEpisode(paths, episodeId, sourcePath, content);
   const title = basename(sourcePath);
   const sections = splitContentIntoSections(input.kind, contentText);
   const sectionIds = sections.map(() => createId("sec"));
@@ -267,13 +268,20 @@ interface ExistingSource {
   raw_path: string;
 }
 
-function copyRawEpisode(paths: VaultPaths, episodeId: string, sourcePath: string): string {
+function copyRawEpisode(paths: VaultPaths, episodeId: string, sourcePath: string, content: Buffer): string {
   const rawDir = join(paths.rawDir, "episodes");
   mkdirSync(rawDir, { recursive: true });
   const extension = extname(sourcePath) || ".txt";
   const rawPath = join(rawDir, `${episodeId}${extension}`);
+  const store = hostedArtifactStore(paths.root);
+  if (store) return store.write(rawPath, content, "raw");
+  const { copyFileSync } = requireFs();
   copyFileSync(sourcePath, rawPath);
   return rawPath;
+}
+
+function requireFs(): typeof import("node:fs") {
+  return createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
 }
 
 function selectSectionIds(db: UmosDatabase, sourceId: string): string[] {

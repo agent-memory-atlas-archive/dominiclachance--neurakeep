@@ -43,7 +43,7 @@ Use stdio MCP for local agent memory. The command should point at the built CLI:
   "mcpServers": {
     "neurakeep": {
       "command": "node",
-      "args": ["C:/Users/macro/.openclaw/workspace/projects/universal-memory-os/dist/cli/index.js", "mcp", "--root", "C:/Users/macro/.openclaw/workspace/projects/universal-memory-os/.umos"]
+      "args": ["C:/path/to/neurakeep/dist/cli/index.js", "mcp", "--root", "C:/path/to/your-vault/.umos"]
     }
   }
 }
@@ -56,7 +56,7 @@ Keep write behavior queue-first: agents may call `memory_propose_update`, but du
 Use:
 
 ```powershell
-claude mcp add neurakeep node C:/Users/macro/.openclaw/workspace/projects/universal-memory-os/dist/cli/index.js mcp --root C:/Users/macro/.openclaw/workspace/projects/universal-memory-os/.umos
+claude mcp add neurakeep node C:/path/to/neurakeep/dist/cli/index.js mcp --root C:/path/to/your-vault/.umos
 claude mcp get neurakeep
 ```
 
@@ -72,15 +72,16 @@ Hosted deployments expose JSON-RPC over HTTPS at `/mcp`.
 
 Authentication options:
 
+- Interactive remote connectors: OAuth 2.1 browser sign-in and consent with PKCE S256, dynamic client registration, one-hour access tokens, and rotating refresh tokens
 - Browser/user sessions: `Authorization: Bearer <Google ID token verified by Firebase Auth>`
 - Customer agent sessions: `Authorization: Bearer <tenant-bound token created in Settings>`
-- Deployment health/admin sessions: `Authorization: Bearer <system service token>`
+- Automated health sessions: `Authorization: Bearer <read-only, expiring per-space grant>`
 
 Customer MCP tokens are stored only as SHA-256 hashes, inherit the owner's Stripe entitlement, and
 resolve to the same isolated tenant vault as the owner's Firebase session. Revocation takes effect on
 the next request. A token from one account cannot select or read another account's vault.
 
-Start a hosted server with Google sign-in/Firebase Auth, Stripe entitlements, and service-token auth:
+Start a hosted server with Google sign-in/Firebase Auth, Stripe entitlements, and managed autonomous-agent grants:
 
 ```powershell
 $env:NEURAKEEP_PUBLIC_URL = "https://app.neurakeep.com"
@@ -105,9 +106,11 @@ GET /.well-known/mcp/server-card.json
 
 The card is generated from the same manifest as MCP `tools/list`, declares OAuth2 authentication, and contains only server metadata and tool input schemas. It must never include credentials, user identifiers, source content, or example memory records.
 
-The OAuth metadata is for connector discovery. Signed-in hosted customers create and revoke their
-own tenant-bound MCP tokens in Settings. The raw value is displayed once and must never be committed
-to a repository.
+Claude and other compatible remote clients discover NeuraKeep's OAuth endpoints, register dynamically,
+open the browser for NeuraKeep/Firebase sign-in, and ask the user to approve the selected space and
+scopes. Signed-in customers can still create and revoke manual tenant-bound grants in Settings for
+clients that need non-interactive bearer-token configuration. Raw grant values are displayed once and
+must never be committed to a repository.
 
 ## Codex
 
@@ -119,9 +122,10 @@ node dist/cli/index.js serve --root .umos --ui --read-write --host 127.0.0.1 --p
 
 Then call `/mcp` with JSON-RPC. Read-only mode disables proposal/apply tools; read-write mode still produces proposals first.
 
-For remote Codex/OpenClaw/Claude connectors, configure the HTTPS `/mcp` URL and pass the customer's
-tenant-bound token as a bearer token. `NEURAKEEP_SERVICE_TOKENS` is reserved for deployment health
-and administration, not shared customer access.
+For OAuth-capable remote connectors such as Claude, configure only the HTTPS `/mcp` URL and complete
+the browser authorization flow. For non-interactive Codex/OpenClaw integrations, pass a customer-created
+tenant-bound grant as a bearer token. `NEURAKEEP_SERVICE_TOKENS` is reserved for deployment health and
+administration, not shared customer access.
 
 ## Smoke Test
 

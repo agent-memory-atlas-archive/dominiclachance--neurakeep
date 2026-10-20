@@ -24,7 +24,8 @@ export function serveCommand(options: ServeCommandOptions): void {
     throw new Error(`No initialized NeuraKeep vault found at ${paths.root}`);
   }
 
-  if (options.ui) {
+  const hosted = Boolean(options.hosted) || process.env.NEURAKEEP_HOSTED === "1";
+  if (options.ui && !hosted) {
     const db = openDatabase(paths.dbPath);
     try {
       migrateDatabase(db);
@@ -42,7 +43,7 @@ export function serveCommand(options: ServeCommandOptions): void {
     readOnly: !options.readWrite,
     serveUi: Boolean(options.ui),
     hosted: {
-      enabled: Boolean(options.hosted) || process.env.NEURAKEEP_HOSTED === "1",
+      enabled: hosted,
       firebaseProjectId: options.firebaseProject ?? process.env.FIREBASE_PROJECT_ID
     }
   });

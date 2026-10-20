@@ -44,19 +44,15 @@ and enterprise policy packs can remain proprietary while the local core stays fr
 
 ## Safe Publishing Checklist
 
-Install the local guardrails once:
-
-```powershell
-git config core.hooksPath .githooks
-```
-
 Before pushing a public release:
 
+- Run `npm ci` on Node.js 22 or newer.
 - Run `npm run check:secrets`.
+- Run `npm run release:check`.
 - Run `npm run typecheck`, `npm run build:all`, `npm test`, and `npm run e2e`.
-- Run `npm run package:oss`.
-- Run `node scripts/release-check.mjs release/oss`.
-- Publish only from `release/oss` or from a freshly verified clean clone.
+- Run `npm pack --dry-run` and confirm the manifest contains both `dist/` and `web-dist/`.
+- Publish only from a freshly verified clean clone.
 
-The release check refuses `.umos`, `.env*`, raw memory, generated build/test artifacts,
-private hosted docs, and Firebase implementation imports.
+The release check refuses `.umos`, `.env*`, raw memory, private hosted docs, tracked build/test
+artifacts, and Firebase implementation imports. Generated `dist/` and `web-dist/` directories are
+allowed only as untracked package outputs and are scanned before publishing.

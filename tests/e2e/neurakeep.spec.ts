@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 test("NeuraKeep routed React app core flows", async ({ page }) => {
   await page.goto("/index.html");
-  await expect(page.getByRole("heading", { name: "NeuraKeep" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "NeuraKeep", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Log out" })).toBeVisible();
   await expect(page.getByTestId("graph-svg")).toBeVisible();
   await expect(page.locator(".toolbar input")).toHaveValue("");

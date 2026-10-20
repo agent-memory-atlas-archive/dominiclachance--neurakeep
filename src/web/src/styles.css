@@ -103,23 +103,29 @@ button:disabled {
 }
 
 .authPanel.subscriptionPanel {
-  width: min(820px, 100%);
+  width: min(1120px, 100%);
   max-height: calc(100vh - 36px);
   overflow: auto;
 }
 
 .subscriptionPlans {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
   margin: 16px 0;
 }
 
 .subscriptionPlan {
+  display: flex;
+  flex-direction: column;
   border: 1px solid #394047;
   border-radius: 8px;
   background: #1d2226;
   padding: 16px;
+}
+
+.subscriptionPlan > button {
+  margin-top: auto;
 }
 
 .subscriptionPlan.selected {
@@ -159,7 +165,7 @@ button:disabled {
   background: rgba(63, 139, 116, .18);
 }
 
-@media (max-width: 680px) {
+@media (max-width: 760px) {
   .subscriptionPlans {
     grid-template-columns: 1fr;
   }

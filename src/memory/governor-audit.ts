@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { createId } from "../core/ids.js";
 import type { VaultPaths } from "../core/paths.js";
 import type { UmosDatabase } from "../db/client.js";
+import { hostedArtifactStore } from "../security/artifact-store.js";
 
 export interface GovernorAuditEntry {
   id: string;
@@ -25,15 +26,15 @@ export function recordGovernorAudit(
     undoable: entry.before.length > 0
   };
   mkdirSync(join(paths.root, "logs"), { recursive: true });
-  appendFileSync(auditPath(paths), `${JSON.stringify(full)}\n`, "utf8");
+  appendAudit(paths, `${JSON.stringify(full)}\n`);
   return full;
 }
 
 export function listGovernorAudit(paths: VaultPaths, limit = 50): GovernorAuditEntry[] {
-  if (!existsSync(auditPath(paths))) {
+  if (!auditExists(paths)) {
     return [];
   }
-  return readFileSync(auditPath(paths), "utf8")
+  return readAudit(paths)
     .split(/\r?\n/)
     .filter(Boolean)
     .map((line) => JSON.parse(line) as GovernorAuditEntry)
@@ -60,7 +61,7 @@ export function undoGovernorAudit(db: UmosDatabase, paths: VaultPaths, auditId: 
       String(row.id)
     );
   }
-  appendFileSync(auditPath(paths), `${JSON.stringify({
+  appendAudit(paths, `${JSON.stringify({
     id: createId("gov"),
     createdAt: new Date().toISOString(),
     action: "undo",
@@ -68,7 +69,7 @@ export function undoGovernorAudit(db: UmosDatabase, paths: VaultPaths, auditId: 
     before: [],
     after: entry.before,
     undoable: false
-  })}\n`, "utf8");
+  })}\n`);
   return { ok: true, undone: auditId, restored: entry.before.length };
 }
 
@@ -98,6 +99,26 @@ export function supersedeTimeline(db: UmosDatabase): Array<Record<string, unknow
 
 function auditPath(paths: VaultPaths): string {
   return join(paths.root, "logs", "governor-audit.jsonl");
+}
+
+function auditExists(paths: VaultPaths): boolean {
+  const store = hostedArtifactStore(paths.root);
+  return store ? existsSync(store.encryptedPath(auditPath(paths))) : existsSync(auditPath(paths));
+}
+
+function readAudit(paths: VaultPaths): string {
+  const store = hostedArtifactStore(paths.root);
+  if (store) {
+    const encrypted = store.encryptedPath(auditPath(paths));
+    return existsSync(encrypted) ? store.read(encrypted, "state").toString("utf8") : "";
+  }
+  return existsSync(auditPath(paths)) ? readFileSync(auditPath(paths), "utf8") : "";
+}
+
+function appendAudit(paths: VaultPaths, line: string): void {
+  const store = hostedArtifactStore(paths.root);
+  if (store) { store.write(auditPath(paths), `${readAudit(paths)}${line}`, "state"); return; }
+  appendFileSync(auditPath(paths), line, "utf8");
 }
 
 function safeArray(value: string): string[] {

@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { VaultPaths } from "../core/paths.js";
 import type { UmosDatabase } from "../db/client.js";
+import { hostedArtifactStore } from "../security/artifact-store.js";
 
 export interface AppExportResult {
   appDir: string;
@@ -57,6 +58,12 @@ export function exportStaticApp(db: UmosDatabase, paths: VaultPaths): AppExportR
   const cssPath = join(appDir, "app-shell.css");
   const jsPath = join(appDir, "app-shell.js");
   const webDist = resolve(packageRoot(), "web-dist");
+  const hostedStore = hostedArtifactStore(paths.root);
+
+  if (hostedStore) {
+    const encryptedGraphPath = hostedStore.write(graphPath, JSON.stringify(graph, null, 2), "state");
+    return { appDir, indexPath, graphPath: encryptedGraphPath, nodeCount: graph.nodes.length, edgeCount: graph.edges.length };
+  }
 
   if (existsSync(join(webDist, "index.html"))) {
     rmSync(appDir, { recursive: true, force: true });

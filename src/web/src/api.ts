@@ -166,21 +166,36 @@ export interface HostedAccessToken {
   lastUsedAt?: string;
   expiresAt?: string;
   revokedAt?: string;
+  scopes: Array<"memory:read" | "memory:propose" | "memory:apply">;
+  rotationFamilyId?: string;
 }
 
 export async function listHostedTokens(): Promise<HostedAccessToken[]> {
   return (await apiClient.api<{ tokens: HostedAccessToken[] }>("/api/hosted/tokens")).tokens;
 }
 
-export async function createHostedToken(name: string): Promise<HostedAccessToken & { token: string; warning: string }> {
+export async function createHostedToken(name: string, scopes: HostedAccessToken["scopes"], expiresInDays: number): Promise<HostedAccessToken & { token: string; warning: string }> {
   return apiClient.api<HostedAccessToken & { token: string; warning: string }>("/api/hosted/tokens", {
     method: "POST",
-    body: JSON.stringify({ name })
+    body: JSON.stringify({ name, scopes, expiresInDays })
+  });
+}
+
+export async function rotateHostedToken(id: string, expiresInDays: number): Promise<HostedAccessToken & { token: string; warning: string }> {
+  return apiClient.api<HostedAccessToken & { token: string; warning: string }>("/api/hosted/tokens/rotate", {
+    method: "POST", body: JSON.stringify({ id, expiresInDays })
   });
 }
 
 export async function revokeHostedToken(id: string): Promise<void> {
   await apiClient.api("/api/hosted/tokens/revoke", { method: "POST", body: JSON.stringify({ id }) });
+}
+
+export async function completeOAuthAuthorization(request: Record<string, string>, approved: boolean): Promise<{ redirectTo: string }> {
+  return apiClient.api<{ redirectTo: string }>("/oauth/authorize/complete", {
+    method: "POST",
+    body: JSON.stringify({ ...request, approved })
+  });
 }
 
 export interface HostedOrganization {

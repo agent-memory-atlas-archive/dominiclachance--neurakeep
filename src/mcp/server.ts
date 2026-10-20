@@ -23,6 +23,9 @@ export interface JsonRpcResponse {
   };
 }
 
+const supportedProtocolVersions = new Set(["2025-11-25", "2025-06-18", "2025-03-26"]);
+const latestProtocolVersion = "2025-11-25";
+
 export function runMcpServer(paths: VaultPaths): void {
   const db = openDatabase(paths.dbPath);
   migrateDatabase(db);
@@ -60,14 +63,23 @@ export function handleJsonRpcRequest(
   request: JsonRpcRequest
 ): JsonRpcResponse | null {
   if (request.method === "initialize") {
+    const requestedVersion = typeof request.params?.protocolVersion === "string"
+      ? request.params.protocolVersion
+      : undefined;
     return makeResponse(request.id, {
-      protocolVersion: "2025-03-26",
+      protocolVersion: requestedVersion && supportedProtocolVersions.has(requestedVersion)
+        ? requestedVersion
+        : latestProtocolVersion,
       capabilities: { tools: {} },
       serverInfo: { ...NEURAKEEP_SERVER_INFO }
     });
   }
 
   if (request.method === "notifications/initialized") {
+    return null;
+  }
+
+  if (request.id === undefined) {
     return null;
   }
 
@@ -114,11 +126,9 @@ function callTool(
 
   if (name === "memory_propose_update") {
     const sourceId = stringArg(args.source_id ?? args.id, "source_id");
-    const extractor = optionalString(args.extractor) === "command" ? "command" : "deterministic";
     return content(
       proposeSourceExtraction(db, sourceId, {
-        extractor,
-        extractorCommand: optionalString(args.extractor_command),
+        extractor: "deterministic",
         reportPaths: paths
       })
     );

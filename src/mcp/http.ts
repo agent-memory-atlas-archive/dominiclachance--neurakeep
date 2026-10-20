@@ -10,6 +10,7 @@ import {
   statSync,
   watch,
   writeFileSync,
+  rmSync,
   type FSWatcher
 } from "node:fs";
 import { basename, dirname, extname, join, normalize, relative, resolve } from "node:path";
@@ -73,9 +74,23 @@ import {
   authenticateHostedAccessToken,
   issueHostedAccessToken,
   listHostedAccessTokens,
+  rotateHostedAccessToken,
   revokeHostedAccessToken
 } from "../hosted/access-tokens.js";
+import {
+  authorizationDenied,
+  exchangeOAuthToken,
+  issueAuthorizationCode,
+  OAuthError,
+  registerOAuthClient,
+  validateAuthorizationRequest
+} from "../hosted/oauth.js";
 import { tenantIdForServiceTokenHash } from "../hosted/tenant-id.js";
+import { hostedVaultGrant, type HostedGrantScope } from "../hosted/firebase-auth.js";
+import { recoveryKeyProviderFromEnv, type RecoveryKeyProvider } from "../security/key-provider.js";
+import { getOrCreateSpaceKey, recoverSpaceKey } from "../security/space-keys.js";
+import { hostedArtifactStore } from "../security/artifact-store.js";
+import { secureAtomicWrite, secureDirectory } from "../security/filesystem.js";
 import { assertHostedCapability, capabilityForApi, capabilityForMcpTool } from "../hosted/authorization.js";
 import {
   acceptOrganizationInvitation,
@@ -150,9 +165,12 @@ interface AuthSettingsFile {
 }
 
 export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOptions): Server {
+  assertSecureHttpBinding(options);
+  if (options.hosted?.enabled && process.platform !== "win32") process.umask(0o077);
   const controlDb = openDatabase(paths.dbPath);
   const tenantVaults = new Map<string, HostedVaultContext>();
   migrateDatabase(controlDb);
+  const recoveryKeyProvider = options.hosted?.enabled ? recoveryKeyProviderFromEnv() : undefined;
   restorePersistedWatcher(controlDb, paths);
 
   const server = createServer(async (req, res) => {
@@ -179,6 +197,62 @@ export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOption
 
       if (requestUrl.pathname === "/.well-known/oauth-authorization-server") {
         sendJson(res, 200, oauthAuthorizationServerMetadata(req, options));
+        return;
+      }
+
+      if (options.hosted?.enabled && ["/oauth/register", "/register"].includes(requestUrl.pathname) && req.method === "POST") {
+        try {
+          const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+          sendJsonNoStore(res, 201, registerOAuthClient(controlDb, body));
+        } catch (error) {
+          sendOAuthError(res, error);
+        }
+        return;
+      }
+
+      if (options.hosted?.enabled && ["/oauth/authorize", "/authorize"].includes(requestUrl.pathname) && req.method === "GET") {
+        try {
+          const request = validateAuthorizationRequest(controlDb, requestUrl.searchParams, `${publicBaseUrl(req, options)}/mcp`);
+          const consentUrl = new URL(`${publicBaseUrl(req, options)}/app/`);
+          consentUrl.searchParams.set("oauth", "1");
+          for (const [name, value] of requestUrl.searchParams) consentUrl.searchParams.set(name, value);
+          consentUrl.searchParams.set("client_name", request.clientName);
+          res.writeHead(302, { location: consentUrl.toString(), "cache-control": "no-store", pragma: "no-cache" });
+          res.end();
+        } catch (error) {
+          sendOAuthError(res, error);
+        }
+        return;
+      }
+
+      if (options.hosted?.enabled && requestUrl.pathname === "/oauth/authorize/complete" && req.method === "POST") {
+        try {
+          const actor = await authorizeRequest(req, controlDb, options);
+          if (!actor) throw new OAuthError("access_denied", "Sign in to NeuraKeep before approving this connector.", 401);
+          const billing = billingAccessStatus(controlDb, actor);
+          if (!billing.entitled) throw new OAuthError("access_denied", "An active NeuraKeep subscription is required.", 403);
+          const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+          const params = new URLSearchParams();
+          for (const name of ["client_id", "redirect_uri", "response_type", "code_challenge", "code_challenge_method", "scope", "state", "resource"]) {
+            if (body[name] !== undefined) params.set(name, String(body[name]));
+          }
+          const request = validateAuthorizationRequest(controlDb, params, `${publicBaseUrl(req, options)}/mcp`);
+          sendJson(res, 200, body.approved === false ? authorizationDenied(request) : issueAuthorizationCode(controlDb, actor, request));
+        } catch (error) {
+          sendOAuthError(res, error);
+        }
+        return;
+      }
+
+      if (options.hosted?.enabled && ["/oauth/token", "/token"].includes(requestUrl.pathname) && req.method === "POST") {
+        try {
+          if (!recoveryKeyProvider) throw new OAuthError("server_error", "Hosted key recovery is unavailable.", 500);
+          const params = new URLSearchParams(await readBody(req));
+          const tokens = exchangeOAuthToken(controlDb, params, headerValue(req.headers.authorization), recoveryKeyProvider, `${publicBaseUrl(req, options)}/mcp`);
+          sendJsonNoStore(res, 200, tokens);
+        } catch (error) {
+          sendOAuthError(res, error);
+        }
         return;
       }
 
@@ -214,7 +288,7 @@ export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOption
       if (req.url === "/mcp" && req.method === "POST") {
         const actor = await authorizeRequest(req, controlDb, options);
         if (!actor) {
-          sendJson(res, 401, { error: "unauthorized" });
+          sendUnauthorized(res, req, options);
           return;
         }
         const billing = billingAccessStatus(controlDb, actor);
@@ -222,7 +296,7 @@ export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOption
           sendJson(res, 402, { error: "subscription_required", billing });
           return;
         }
-        const vault = requestVault(controlDb, paths, actor, options, tenantVaults);
+        const vault = requestVault(controlDb, paths, actor, options, tenantVaults, recoveryKeyProvider);
         try {
           const body = await readBody(req);
           const payload = JSON.parse(body) as unknown;
@@ -236,6 +310,11 @@ export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOption
             status: "ok",
             metadata: { batch: Array.isArray(payload), readOnly: options.readOnly }
           });
+          if (response === null || (Array.isArray(response) && response.length === 0)) {
+            res.writeHead(202, { "cache-control": "no-store" });
+            res.end();
+            return;
+          }
           sendJson(res, 200, response);
         } finally {
           vault.close();
@@ -250,7 +329,7 @@ export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOption
         }
         const actor = await authorizeRequest(req, controlDb, options);
         if (!actor) {
-          sendJson(res, 401, { error: "unauthorized" });
+          sendUnauthorized(res, req, options);
           return;
         }
         if (requestUrl.pathname.startsWith("/api/billing/")) {
@@ -269,10 +348,10 @@ export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOption
           return;
         }
         if (requestUrl.pathname.startsWith("/api/hosted/tokens")) {
-          await handleHostedTokenRequest(controlDb, req, res, actor, options.readOnly);
+          await handleHostedTokenRequest(controlDb, req, res, actor, options.readOnly, recoveryKeyProvider);
           return;
         }
-        const vault = requestVault(controlDb, paths, actor, options, tenantVaults);
+        const vault = requestVault(controlDb, paths, actor, options, tenantVaults, recoveryKeyProvider);
         try {
           await handleApiRequest(vault.db, vault.paths, req, res, options, actor, controlDb);
         } finally {
@@ -282,7 +361,7 @@ export function runHttpMcpServer(paths: VaultPaths, options: HttpMcpServerOption
       }
 
       if (options.serveUi && req.method === "GET") {
-        const served = tryServeUi(paths, req, res);
+        const served = tryServeUi(paths, req, res, Boolean(options.hosted?.enabled));
         if (served) {
           return;
         }
@@ -531,17 +610,31 @@ async function handleHostedTokenRequest(
   req: IncomingMessage,
   res: ServerResponse,
   actor: HostedActor,
-  readOnly: boolean
+  readOnly: boolean,
+  recoveryKeyProvider?: RecoveryKeyProvider
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  assertHostedCapability(actor, "manage_policy");
   if (url.pathname === "/api/hosted/tokens" && req.method === "GET") {
     sendJson(res, 200, { tokens: listHostedAccessTokens(db, actor) });
     return;
   }
   if (url.pathname === "/api/hosted/tokens" && req.method === "POST") {
     assertWritable(readOnly, "access token creation");
-    const body = JSON.parse((await readBody(req)) || "{}") as { name?: string };
-    sendJson(res, 201, issueHostedAccessToken(db, actor, String(body.name ?? "MCP access")));
+    if (!recoveryKeyProvider) throw new Error("Hosted recovery key provider is unavailable.");
+    const body = JSON.parse((await readBody(req)) || "{}") as { name?: string; scopes?: HostedGrantScope[]; expiresInDays?: number };
+    const spaceKey = getOrCreateSpaceKey(db, actor.tenantId, actor.spaceId, recoveryKeyProvider);
+    try { sendJson(res, 201, issueHostedAccessToken(db, actor, { name: body.name, scopes: body.scopes, expiresInDays: body.expiresInDays, spaceKey })); }
+    finally { spaceKey.key.fill(0); }
+    return;
+  }
+  if (url.pathname === "/api/hosted/tokens/rotate" && req.method === "POST") {
+    assertWritable(readOnly, "access token rotation");
+    if (!recoveryKeyProvider) throw new Error("Hosted recovery key provider is unavailable.");
+    const body = JSON.parse((await readBody(req)) || "{}") as { id?: string; expiresInDays?: number };
+    const spaceKey = recoverSpaceKey(db, actor.tenantId, actor.spaceId, recoveryKeyProvider);
+    try { sendJson(res, 201, rotateHostedAccessToken(db, actor, String(body.id ?? ""), spaceKey, body.expiresInDays)); }
+    finally { spaceKey.key.fill(0); }
     return;
   }
   if (url.pathname === "/api/hosted/tokens/revoke" && req.method === "POST") {
@@ -559,13 +652,17 @@ function requestVault(
   basePaths: VaultPaths,
   actor: HostedActor,
   options: HttpMcpServerOptions,
-  tenantVaults: Map<string, HostedVaultContext>
+  tenantVaults: Map<string, HostedVaultContext>,
+  recoveryKeyProvider?: RecoveryKeyProvider
 ): HostedVaultContext {
   if (options.hosted?.enabled && actor.provider !== "local") {
-    const vaultKey = `${actor.tenantId}:${actor.spaceId}`;
+    const granted = actor[hostedVaultGrant];
+    if (!granted && !recoveryKeyProvider) throw new Error("Hosted vault recovery is unavailable.");
+    const resolved = granted ?? getOrCreateSpaceKey(controlDb, actor.tenantId, actor.spaceId, recoveryKeyProvider!);
+    const vaultKey = `${actor.tenantId}:${actor.spaceId}:${resolved.keyVersion}`;
     let vault = tenantVaults.get(vaultKey);
     if (!vault) {
-      vault = openHostedVault(basePaths, actor);
+      vault = openHostedVault(basePaths, actor, resolved);
       tenantVaults.set(vaultKey, vault);
     }
     ensureHostedDefaults(vault.db, actor);
@@ -806,19 +903,25 @@ async function handleApiRequest(
     const uploadContent = Buffer.from(String(body.contentBase64 ?? ""), "base64");
     enforceOrganizationUploadPolicy(controlDb, actor, "internal", uploadContent.toString("utf8"));
     const uploadDir = join(paths.inboxDir, "manual-uploads");
-    mkdirSync(uploadDir, { recursive: true });
+    const hostedStore = hostedArtifactStore(paths.root);
+    if (hostedStore) secureDirectory(uploadDir); else mkdirSync(uploadDir, { recursive: true });
     const uploadPath = join(uploadDir, `${Date.now()}-${fileName}`);
-    writeFileSync(uploadPath, uploadContent);
+    if (hostedStore) secureAtomicWrite(uploadPath, uploadContent); else writeFileSync(uploadPath, uploadContent);
     const kind = body.kind && body.kind !== "auto" ? normalizeIngestKind(body.kind) : kindFromExtension(uploadPath);
-    const ingest = ingestFile(db, paths, {
-      path: uploadPath,
-      kind,
-      space: "project",
-      trustLevel: "observed",
-      sourceOrigin: "manual",
-      visibility: "private",
-      sensitivity: "internal"
-    });
+    let ingest;
+    try {
+      ingest = ingestFile(db, paths, {
+        path: uploadPath,
+        kind,
+        space: "project",
+        trustLevel: "observed",
+        sourceOrigin: "manual",
+        visibility: "private",
+        sensitivity: "internal"
+      });
+    } finally {
+      if (hostedStore) rmSync(uploadPath, { force: true });
+    }
     const proposal = ingest.skipped ? null : proposeSourceExtraction(db, ingest.sourceId, { reportPaths: paths });
     recordHostedAudit(db, {
       actor,
@@ -834,7 +937,7 @@ async function handleApiRequest(
       }
     });
     exportStaticApp(db, paths);
-    sendJson(res, 200, { uploadPath, ingest, proposal, queueOnly: true });
+    sendJson(res, 200, { uploadPath: hostedStore ? null : uploadPath, ingest, proposal, queueOnly: true });
     return;
   }
 
@@ -1401,7 +1504,7 @@ function isHighValueProposal(row: Record<string, unknown>): boolean {
   if (itemCount === 0) return false;
   const text = `${row.summary ?? ""} ${row.space ?? ""} ${row.sensitivity ?? ""}`.toLowerCase();
   if (Number(counts?.failures ?? 0) > 0) return true;
-  return /\b(neurakeep|memory|promarkia|wisdomprompt|agentix|production|decision|decided|policy|mcp|openclaw|codex|claude|pdf|watcher|sync|dedupe|failure|do not repeat|seo|client|security|scheduler)\b/i.test(text);
+  return /\b(neurakeep|memory|production|decision|decided|policy|mcp|openclaw|codex|claude|pdf|watcher|sync|dedupe|failure|do not repeat|client|security|scheduler)\b/i.test(text);
 }
 
 function triageNoisyWarningProposals(
@@ -1900,12 +2003,14 @@ function betaLaunchFlow(db: UmosDatabase, paths: VaultPaths, options: HttpMcpSer
   const storage = hostedStorageStatus(paths, options, actor);
   const integrations = integrationStatus(db, paths, options, actor);
   const hostedEnabled = Boolean(options.hosted?.enabled);
-  const serviceTokensReady = serviceTokenConfigs(options).length > 0;
+  const autonomousGrantsReady = Number((db.prepare(`SELECT COUNT(*) AS count FROM hosted_access_tokens token
+    JOIN hosted_agent_grants grant ON grant.token_id = token.id
+    WHERE token.revoked_at IS NULL AND grant.revoked_at IS NULL AND token.expires_at > ?`).get(new Date().toISOString()) as { count: number }).count) > 0;
   const steps = [
     betaStep("signup", hostedEnabled, "Google sign-in is enabled through Firebase Auth."),
     betaStep("tenant_space", listHostedSpaces(db, actor.tenantId).length > 0, "An isolated tenant vault and personal space exist for the account."),
     betaStep("hosted_storage", Boolean(storage.ok), "Hosted storage provider/bucket is configured."),
-    betaStep("remote_mcp", hostedEnabled && serviceTokensReady, "Remote MCP has Firebase and at least one service-token path."),
+    betaStep("remote_mcp", hostedEnabled && autonomousGrantsReady, "Remote MCP has at least one active, expiring per-space autonomous-agent grant."),
     betaStep("import_memory", Number(counts.sources ?? 0) > 0, "Memory sources are indexed."),
     betaStep("review_proposals", Number(counts.warningProposals ?? 0) === 0 && Number(counts.blockedProposals ?? 0) === 0, "Proposal queue has no warning or blocked items."),
     betaStep("search_read", Number(counts.sections ?? 0) > 0, "Search/read memory surface has indexed sections.")
@@ -1985,8 +2090,7 @@ function hostedOpsStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcpSe
   }
   const serviceTokens = serviceTokenConfigs(options);
   const backupHints = [
-    "/home/admin/backups/neurakeep",
-    "/var/backups/neurakeep",
+    process.env.NEURAKEEP_BACKUP_PATH || "/var/backups/neurakeep",
     storage.bucket ? `gs://${storage.bucket}` : null
   ].filter(Boolean);
   return {
@@ -2001,14 +2105,14 @@ function hostedOpsStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcpSe
     backup: {
       configured: Boolean(storage.bucket || process.env.NEURAKEEP_BACKUP_BUCKET || process.env.NEURAKEEP_BACKUP_PATH),
       bucket: process.env.NEURAKEEP_BACKUP_BUCKET || storage.bucket || null,
-      localPath: process.env.NEURAKEEP_BACKUP_PATH || "/home/admin/backups/neurakeep",
+      localPath: process.env.NEURAKEEP_BACKUP_PATH || null,
       hints: backupHints,
-      verification: "Use scripts/deploy-hosted.ps1 for pre-deploy tar backups and hosted smoke checks; use scripts/hosted-healthcheck.ps1 for recurring checks."
+      verification: "Verify backups with your deployment procedure and perform regular restore drills."
     },
     alerting: {
       pm2Process: process.env.NEURAKEEP_PM2_PROCESS || "neurakeep-hosted",
       webhookConfigured: Boolean(process.env.NEURAKEEP_ALERT_WEBHOOK_URL),
-      reminder: "Configure a cron/PM2 monitor to call /health, /api/hosted/storage, and /mcp tools/list with a service token."
+      reminder: "Configure monitoring for /health and use a dedicated, read-only, expiring per-space grant for authenticated MCP checks."
     },
     serviceTokens: {
       configured: serviceTokens.length > 0,
@@ -2070,13 +2174,13 @@ function integrationStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcp
     },
     remoteMcp: {
       endpoint: `${publicBase}/mcp`,
-      authModes: ["Google ID token", "service token"],
+      authModes: ["Firebase-verified identity", "per-space autonomous-agent grant"],
       serviceTokenConfigured: serviceTokens.length > 0,
       protectedResourceMetadata: `${publicBase}/.well-known/oauth-protected-resource/mcp`,
       authorizationServerMetadata: `${publicBase}/.well-known/oauth-authorization-server`,
       clientHints: [
         "Use Authorization: Bearer <Google ID token> for browser/user sessions.",
-        "Use Authorization: Bearer <service token> for Claude/OpenClaw/Codex service connectors.",
+        "Use Authorization: Bearer <autonomous-agent grant> for Claude/OpenClaw/Codex connectors.",
         "Prefer NEURAKEEP_SERVICE_TOKENS=sha256:<hash> in hosted deployments so raw tokens are not stored in process config."
       ]
     },
@@ -2089,7 +2193,7 @@ function integrationStatus(db: UmosDatabase, paths: VaultPaths, options: HttpMcp
     tools: toolNames,
     clients,
     smokeTests: [
-      { name: "search", tool: "memory_search", arguments: { query: "Promarkia scheduled task lessons", limit: 5, neighbors: 1 } },
+      { name: "search", tool: "memory_search", arguments: { query: "deployment decisions and known failures", limit: 5, neighbors: 1 } },
       { name: "read", tool: "memory_read", note: "Use an id returned by memory_search." },
       { name: "propose", tool: "memory_propose_update", note: "Creates a pending proposal only; review before applying." },
       { name: "apply", tool: "memory_apply_update", note: "Only use after explicit approval or a clean reviewed proposal." }
@@ -2353,10 +2457,10 @@ function oauthProtectedResourceMetadata(req: IncomingMessage, options: HttpMcpSe
   const baseUrl = publicBaseUrl(req, options);
   return {
     resource: `${baseUrl}/mcp`,
-    authorization_servers: [`${baseUrl}/.well-known/oauth-authorization-server`],
+    authorization_servers: [baseUrl],
     bearer_methods_supported: ["header"],
     resource_documentation: `${baseUrl}/docs/mcp`,
-    scopes_supported: ["memory:read", "memory:propose", "memory:write"],
+    scopes_supported: ["memory:read", "memory:propose", "memory:apply"],
     neurakeep: {
       endpoint: `${baseUrl}/mcp`,
       hosted: Boolean(options.hosted?.enabled),
@@ -2371,13 +2475,17 @@ function oauthAuthorizationServerMetadata(req: IncomingMessage, options: HttpMcp
   const baseUrl = publicBaseUrl(req, options);
   return {
     issuer: baseUrl,
-    token_endpoint_auth_methods_supported: ["client_secret_basic", "private_key_jwt", "none"],
+    authorization_endpoint: `${baseUrl}/oauth/authorize`,
+    token_endpoint: `${baseUrl}/oauth/token`,
+    registration_endpoint: `${baseUrl}/oauth/register`,
+    token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"],
     response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code", "client_credentials"],
-    scopes_supported: ["memory:read", "memory:propose", "memory:write"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    scopes_supported: ["memory:read", "memory:propose", "memory:apply"],
     service_documentation: `${baseUrl}/docs/mcp`,
     neurakeep: {
-      note: "Hosted NeuraKeep accepts Google ID tokens verified through Firebase Auth and pre-issued service tokens. Full OAuth authorization-code issuance is supplied by the deployment identity provider.",
+      note: "Hosted NeuraKeep accepts Firebase-verified identity and per-space, expiring autonomous-agent grants. The authorized runtime decrypts the selected space while serving a request.",
       protectedResourceMetadata: `${baseUrl}/.well-known/oauth-protected-resource/mcp`
     }
   };
@@ -2483,6 +2591,7 @@ function serviceTokenActor(req: IncomingMessage, db: UmosDatabase, options: Http
   if (!token) return null;
   const managed = authenticateHostedAccessToken(db, token);
   if (managed) return managed;
+  if (options.hosted?.enabled && process.env.NEURAKEEP_ALLOW_LEGACY_SERVICE_TOKENS !== "1") return null;
   const configs = serviceTokenConfigs(options);
   if (configs.length === 0) return null;
   const tokenHash = sha256(token);
@@ -2585,19 +2694,52 @@ function authSettingsPath(paths: VaultPaths): string {
 function readBody(req: IncomingMessage, maxBytes = 2_000_000): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = "";
+    let settled = false;
+    const declaredLength = Number(req.headers["content-length"] ?? 0);
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      req.resume();
+      reject(new HttpStatusError(413, "Request body too large"));
+      return;
+    }
     req.setEncoding("utf8");
     req.on("data", (chunk) => {
+      if (settled) return;
       body += chunk;
       if (body.length > maxBytes) {
-        reject(new Error("Request body too large"));
+        settled = true;
+        body = "";
+        req.resume();
+        reject(new HttpStatusError(413, "Request body too large"));
       }
     });
-    req.on("end", () => resolve(body));
-    req.on("error", reject);
+    req.on("end", () => {
+      if (!settled) {
+        settled = true;
+        resolve(body);
+      }
+    });
+    req.on("error", (error) => {
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    });
   });
 }
 
-function tryServeUi(paths: VaultPaths, req: IncomingMessage, res: ServerResponse): boolean {
+export function assertSecureHttpBinding(options: HttpMcpServerOptions): void {
+  const authenticated = Boolean(options.hosted?.enabled || options.token || serviceTokenConfigs(options).length > 0);
+  if (!isLoopbackHost(options.host) && !authenticated) {
+    throw new Error("Refusing to bind NeuraKeep to a non-loopback host without authentication. Set --token, --service-token, or enable hosted authentication.");
+  }
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return normalized === "localhost" || normalized === "::1" || /^127(?:\.\d{1,3}){3}$/.test(normalized) || /^::ffff:127(?:\.\d{1,3}){3}$/.test(normalized);
+}
+
+function tryServeUi(paths: VaultPaths, req: IncomingMessage, res: ServerResponse, hosted = false): boolean {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const pathname = uiPathname(url.pathname);
   const relative = normalize(pathname.replace(/^\/+/, ""));
@@ -2605,7 +2747,10 @@ function tryServeUi(paths: VaultPaths, req: IncomingMessage, res: ServerResponse
     return false;
   }
 
-  const filePath = join(paths.root, "app", relative);
+  const uiRoot = hosted
+    ? resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "web-dist")
+    : join(paths.root, "app");
+  const filePath = join(uiRoot, relative);
   try {
     const stat = statSync(filePath);
     if (!stat.isFile()) {
@@ -3366,10 +3511,27 @@ function sendJson(res: ServerResponse, status: number, value: unknown): void {
   res.end(JSON.stringify(value));
 }
 
+function sendJsonNoStore(res: ServerResponse, status: number, value: unknown): void {
+  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", pragma: "no-cache" });
+  res.end(JSON.stringify(value));
+}
+
+function sendOAuthError(res: ServerResponse, error: unknown): void {
+  const oauth = error instanceof OAuthError ? error : new OAuthError("server_error", "The OAuth request could not be completed.", 500);
+  if (oauth.status === 401) res.setHeader("www-authenticate", 'Basic realm="NeuraKeep OAuth"');
+  sendJsonNoStore(res, oauth.status, { error: oauth.error, error_description: oauth.message });
+}
+
+function sendUnauthorized(res: ServerResponse, req: IncomingMessage, options: HttpMcpServerOptions): void {
+  const metadata = `${publicBaseUrl(req, options)}/.well-known/oauth-protected-resource/mcp`;
+  res.setHeader("www-authenticate", `Bearer resource_metadata="${metadata}", scope="memory:read memory:propose"`);
+  sendJson(res, 401, { error: "unauthorized" });
+}
+
 function setCors(res: ServerResponse): void {
   res.setHeader("access-control-allow-origin", "*");
   res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
-  res.setHeader("access-control-allow-headers", "content-type,authorization");
+  res.setHeader("access-control-allow-headers", "content-type,authorization,x-neurakeep-tenant,x-neurakeep-space");
 }
 
 function contentType(filePath: string): string {

@@ -8,14 +8,9 @@ const releaseMode = args.includes("--release") || process.env.NEURAKEEP_RELEASE_
 const targetArg = args.find((arg) => !arg.startsWith("--"));
 const root = resolve(process.cwd(), targetArg ?? ".");
 const forbiddenPaths = [
-  ".umos",
-  "dist",
-  "web-dist",
   "marketing-site",
-  "test-results",
-  "playwright-report",
-  "blob-report"
 ];
+const forbiddenTrackedPaths = [...forbiddenPaths, ".umos", "dist", "web-dist", "test-results", "playwright-report", "blob-report"];
 const forbiddenFiles = [
   ".env",
   ".env.local",
@@ -59,7 +54,7 @@ const allowPatternFiles = new Set(["scripts/security-scan.mjs"]);
 const scanExtensions = new Set([
   ".cjs", ".css", ".html", ".js", ".json", ".jsonl", ".md", ".mjs", ".sql", ".svg", ".ts", ".tsx", ".txt", ".yaml", ".yml"
 ]);
-const skipDirs = new Set([".git", "node_modules", "dist", "web-dist", ".umos", "release", "test-results", "playwright-report", "blob-report"]);
+const skipDirs = new Set([".git", ".worktrees", ".superpowers", ".npm-cache", "node_modules", ".umos", "release", "test-results", "playwright-report", "blob-report"]);
 
 const errors = [];
 
@@ -73,7 +68,7 @@ if (releaseMode) {
 
 for (const file of trackedFiles()) {
   const normalized = file.split("\\").join("/");
-  if (forbiddenPaths.some((path) => normalized === path || normalized.startsWith(`${path}/`))) {
+  if (forbiddenTrackedPaths.some((path) => normalized === path || normalized.startsWith(`${path}/`))) {
     errors.push(`Forbidden tracked path: ${normalized}`);
   }
   if (!allowSecretFiles.has(normalized) && (forbiddenFiles.includes(normalized) || /^\.env\./.test(normalized))) {

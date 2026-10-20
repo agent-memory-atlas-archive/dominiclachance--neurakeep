@@ -1,4 +1,4 @@
-export const NEURAKEEP_VERSION = "0.2.0";
+export const NEURAKEEP_VERSION = "0.3.0";
 
 export const NEURAKEEP_SERVER_INFO = {
   name: "neurakeep",
@@ -46,9 +46,7 @@ const toolDefinitions: Array<Record<string, unknown>> = [
     inputSchema: {
       type: "object",
       properties: {
-        source_id: { type: "string" },
-        extractor: { type: "string" },
-        extractor_command: { type: "string" }
+        source_id: { type: "string" }
       },
       required: ["source_id"]
     }

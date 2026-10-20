@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { dirname } from "node:path";
-import { mkdirSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync, readSync } from "node:fs";
 import { schemaSql } from "./schema.js";
 
 export type UmosDatabase = Database.Database;
@@ -13,6 +13,43 @@ export function openDatabase(dbPath: string, readonly = false): UmosDatabase {
   });
   db.pragma("foreign_keys = ON");
   return db;
+}
+
+export function openEncryptedDatabase(dbPath: string, key: Buffer, readonly = false): UmosDatabase {
+  if (key.length !== 32) throw new Error("A hosted database key must contain exactly 32 bytes.");
+  mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
+  const db = new Database(dbPath, { readonly, fileMustExist: readonly });
+  try {
+    db.pragma("cipher='sqlcipher'");
+    db.pragma("legacy=4");
+    if (db.pragma("cipher", { simple: true }) !== "sqlcipher") throw new Error("SQLite did not activate SQLCipher compatibility mode.");
+    const keyed = db as UmosDatabase & { key?: (value: Buffer) => void };
+    if (typeof keyed.key !== "function") throw new Error("The installed SQLite driver does not provide encryption key support.");
+    keyed.key(key);
+    db.prepare("SELECT count(*) AS count FROM sqlite_master").get();
+    db.pragma("foreign_keys = ON");
+    if (process.platform !== "win32") chmodSync(dbPath, 0o600);
+    return db;
+  } catch (error) {
+    db.close();
+    throw new Error(`Hosted encrypted database could not be opened: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+export function assertEncryptedDatabaseFile(dbPath: string): void {
+  const header = readDatabaseHeader(dbPath);
+  if (header === "SQLite format 3\u0000") throw new Error(`Hosted database has a plaintext SQLite header: ${dbPath}`);
+}
+
+export function readDatabaseHeader(dbPath: string): string {
+  const descriptor = openSync(dbPath, "r");
+  try {
+    const header = Buffer.alloc(16);
+    const bytesRead = readSync(descriptor, header, 0, header.length, 0);
+    return header.subarray(0, bytesRead).toString("ascii");
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 export function migrateDatabase(db: UmosDatabase): void {
@@ -65,6 +102,9 @@ function ensureSchemaV2Columns(db: UmosDatabase): void {
   addColumnIfMissing(db, "proposals", "sensitivity", "TEXT NOT NULL DEFAULT 'normal'");
   addColumnIfMissing(db, "hosted_access_tokens", "email", "TEXT");
   addColumnIfMissing(db, "hosted_access_tokens", "space_id", "TEXT NOT NULL DEFAULT 'personal'");
+  addColumnIfMissing(db, "hosted_access_tokens", "scopes_json", "TEXT NOT NULL DEFAULT '[\"memory:read\",\"memory:propose\"]'");
+  addColumnIfMissing(db, "hosted_access_tokens", "rotation_family_id", "TEXT");
+  addColumnIfMissing(db, "hosted_access_tokens", "rotated_from_id", "TEXT");
 }
 
 function addColumnIfMissing(

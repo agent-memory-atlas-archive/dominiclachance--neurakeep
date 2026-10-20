@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { VaultPaths } from "../core/paths.js";
 import type { UmosDatabase } from "../db/client.js";
+import { hostedArtifactStore } from "../security/artifact-store.js";
 
 export interface WikiCompileResult {
   paths: string[];
@@ -156,8 +157,17 @@ function count(db: UmosDatabase, table: string): number {
 
 function writePage(dir: string, name: string, content: string): string {
   const path = join(dir, name);
+  const store = hostedArtifactStore(findVaultRoot(dir));
+  if (store) return store.write(path, content, "wiki");
   writeFileSync(path, content, "utf8");
   return path;
+}
+
+function findVaultRoot(path: string): string {
+  const normalized = path.replaceAll("\\", "/");
+  const marker = "/wiki";
+  const index = normalized.lastIndexOf(marker);
+  return index >= 0 ? normalized.slice(0, index) : path;
 }
 
 function parseArray(value: string): string[] {

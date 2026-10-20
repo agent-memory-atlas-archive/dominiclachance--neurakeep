@@ -390,6 +390,9 @@ CREATE TABLE IF NOT EXISTS hosted_access_tokens (
   email TEXT,
   name TEXT NOT NULL,
   roles_json TEXT NOT NULL DEFAULT '["mcp"]',
+  scopes_json TEXT NOT NULL DEFAULT '["memory:read","memory:propose"]',
+  rotation_family_id TEXT,
+  rotated_from_id TEXT,
   created_at TEXT NOT NULL,
   last_used_at TEXT,
   expires_at TEXT,
@@ -398,6 +401,87 @@ CREATE TABLE IF NOT EXISTS hosted_access_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_hosted_access_tokens_owner
 ON hosted_access_tokens(tenant_id, user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS hosted_space_keys (
+  tenant_id TEXT NOT NULL,
+  space_id TEXT NOT NULL,
+  key_version INTEGER NOT NULL,
+  provider_id TEXT NOT NULL,
+  wrapped_key BLOB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (tenant_id, space_id)
+);
+
+CREATE TABLE IF NOT EXISTS hosted_agent_grants (
+  id TEXT PRIMARY KEY,
+  token_id TEXT NOT NULL UNIQUE REFERENCES hosted_access_tokens(id) ON DELETE CASCADE,
+  tenant_id TEXT NOT NULL,
+  space_id TEXT NOT NULL,
+  key_version INTEGER NOT NULL,
+  scopes_json TEXT NOT NULL,
+  wrap_salt BLOB NOT NULL,
+  wrapped_space_key BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_agent_grants_space
+ON hosted_agent_grants(tenant_id, space_id, created_at);
+
+CREATE TABLE IF NOT EXISTS hosted_oauth_clients (
+  client_id TEXT PRIMARY KEY,
+  client_secret_hash TEXT,
+  client_name TEXT NOT NULL,
+  redirect_uris_json TEXT NOT NULL,
+  grant_types_json TEXT NOT NULL,
+  response_types_json TEXT NOT NULL,
+  token_endpoint_auth_method TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS hosted_oauth_codes (
+  code_hash TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL REFERENCES hosted_oauth_clients(client_id) ON DELETE CASCADE,
+  redirect_uri TEXT NOT NULL,
+  code_challenge TEXT NOT NULL,
+  tenant_id TEXT NOT NULL,
+  space_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  email TEXT,
+  name TEXT,
+  roles_json TEXT NOT NULL,
+  scopes_json TEXT NOT NULL,
+  resource TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS hosted_oauth_refresh_tokens (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  family_id TEXT NOT NULL,
+  client_id TEXT NOT NULL REFERENCES hosted_oauth_clients(client_id) ON DELETE CASCADE,
+  access_token_id TEXT NOT NULL REFERENCES hosted_access_tokens(id) ON DELETE CASCADE,
+  tenant_id TEXT NOT NULL,
+  space_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  email TEXT,
+  name TEXT,
+  roles_json TEXT NOT NULL,
+  scopes_json TEXT NOT NULL,
+  resource TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT,
+  revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_hosted_oauth_refresh_family
+ON hosted_oauth_refresh_tokens(family_id, created_at);
 
 CREATE TABLE IF NOT EXISTS stripe_webhook_events (
   id TEXT PRIMARY KEY,

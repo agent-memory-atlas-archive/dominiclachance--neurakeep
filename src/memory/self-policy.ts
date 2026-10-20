@@ -15,7 +15,7 @@ export const selfMemoryPolicy: SelfMemoryPolicy = {
     "Manual PDF/markdown uploads can be copied into raw episodes and indexed immediately."
   ],
   durableAutoApply: [
-    "None. Events, facts, failures, decisions, and do-not-repeat guidance stay proposal-reviewed until Dominic explicitly changes this policy."
+    "None. Events, facts, failures, decisions, and do-not-repeat guidance stay proposal-reviewed until the operator explicitly changes this policy."
   ],
   queuedOnly: [
     "All extracted durable memory candidates, including low-risk local notes.",
@@ -25,7 +25,7 @@ export const selfMemoryPolicy: SelfMemoryPolicy = {
   ],
   neverSave: [
     "Secrets, credentials, API keys, bearer tokens, private keys, and auth cookies.",
-    "Full unredacted third-party messages unless Dominic explicitly asks to preserve them.",
+    "Full unredacted third-party messages unless the operator explicitly asks to preserve them.",
     "Public outreach drafts, emails, or social messages before explicit approval.",
     "Production access details beyond high-level operational notes."
   ],
