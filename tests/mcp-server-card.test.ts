@@ -79,7 +79,7 @@ describe("MCP static server card", () => {
 
   it("uses the same version as the published package metadata", () => {
     const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
-    expect(NEURAKEEP_VERSION).toBe("0.3.2");
+    expect(NEURAKEEP_VERSION).toBe("0.3.3");
     expect(packageJson.version).toBe(NEURAKEEP_VERSION);
   });
 
@@ -227,6 +227,41 @@ describe("MCP static server card", () => {
     expect(() => assertSecureHttpBinding({ ...base, host: "::" })).toThrow(/non-loopback host without authentication/);
     expect(() => assertSecureHttpBinding({ ...base, host: "127.0.0.1" })).not.toThrow();
     expect(() => assertSecureHttpBinding({ ...base, host: "0.0.0.0", token: "configured-at-runtime" })).not.toThrow();
+  });
+
+  it("defaults the local app to the Sigma graph interface", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "neurakeep-sigma-default-"));
+    tempRoots.push(projectDir);
+    const root = join(projectDir, ".umos");
+    initCommand({ root });
+    const paths = getVaultPaths(root);
+    const previousEngine = process.env.NEURAKEEP_FLAG_GRAPH_ENGINE;
+    delete process.env.NEURAKEEP_FLAG_GRAPH_ENGINE;
+    const server = runHttpMcpServer(paths, {
+      host: "127.0.0.1",
+      port: 0,
+      readOnly: false,
+      serveUi: true,
+      hosted: { enabled: false }
+    });
+
+    try {
+      await once(server, "listening");
+      const address = server.address() as AddressInfo;
+      const response = await fetch(`http://127.0.0.1:${address.port}/api/auth/settings`);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        provider: "local",
+        firebaseRequired: false,
+        flags: { graph: { engine: "sigma" } },
+        hosted: { firebaseProjectId: null },
+      });
+    } finally {
+      server.close();
+      await once(server, "close");
+      if (previousEngine === undefined) delete process.env.NEURAKEEP_FLAG_GRAPH_ENGINE;
+      else process.env.NEURAKEEP_FLAG_GRAPH_ENGINE = previousEngine;
+    }
   });
 
   it("serves metadata publicly without leaking vault content or credentials", async () => {
